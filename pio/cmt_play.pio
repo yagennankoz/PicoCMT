@@ -1,0 +1,32 @@
+.program cmt_play
+.side_set 1
+
+    ; --- 【初期化領域】最初の1回だけ実行される（.wrap_targetの外） ---
+    ; Xレジスタを初期状態「0（L）」からスタートさせます
+    set x, 0            side 0
+
+.wrap_target
+    pull block          ; DMAからウェイト時間を取得
+    mov y, osr          ; Yレジスタに待機カウントをコピー
+    
+    ; ★レジスタ自身を反転させます（0なら1、1なら0になる）
+    mov x, ~x
+    
+    ; 分岐条件にカンマを入れてパーサーに適合させます
+    jmp !x, target_low side 1
+    
+    ; --- 【Xが1（非0）の場合：Hを出力する工程】 ---
+    mov pins, x        side 1  ; OUTピンに1を出力し、ブザーもH(1)をキープ
+wait_h:
+    jmp y--, wait_h    side 1  ; カウントダウン中もブザーHを完全に維持（爆音化）
+    jmp end_loop       side 1
+
+target_low:
+    ; --- 【Xが0の場合：Lを出力する工程】 ---
+    mov pins, x        side 0  ; OUTピンに0を出力し、ブザーもL(0)をキープ
+wait_l:
+    jmp y--, wait_l    side 0  ; カウントダウン中もブザーLを完全に維持
+    
+end_loop:
+    nop
+.wrap

@@ -1,0 +1,5 @@
+BasedOnStyle: Google
+BreakBeforeBraces: Attach
+InsertBraces: true
+IndentWidth: 4
+files.trimTrailingWhitespace: true

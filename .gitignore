@@ -1,0 +1,5 @@
+.pio
+.vscode
+t88dump/.idea
+t88dump/__pycache__
+localdocs
