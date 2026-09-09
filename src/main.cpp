@@ -412,20 +412,6 @@ void loop() {
                     stop_raw_recording_and_finalize();
                 }
 
-                if (default_rec_fmt == FMT_T88) {
-                    Serial.println(
-                        "Starting conversion: /input.raw -> /output.t88");
-                    convert_raw_to_t88(raw_rec_path, target_filename);
-                } else if (default_rec_fmt == FMT_CMT) {
-                    Serial.println(
-                        "Starting conversion: /input.raw -> /output.cmt");
-                    convert_raw_to_cmt(raw_rec_path, target_filename);
-                } else {
-                    Serial.println(
-                        "Warning: Conversion for this format is not "
-                        "implemented yet.");
-                }
-
                 current_state = STATE_IDLE;
                 reset_and_ignore_pressed_buttons();
                 oled_need_refresh = true;
@@ -436,6 +422,12 @@ void loop() {
 
             if (btn_trigger_clicked[IDX_PLAY]) {
                 btn_trigger_clicked[IDX_PLAY] = false;
+
+                if (playback_time_valid && !play_paused) {
+                    playback_base_time_ms +=
+                        (millis() - playback_tag_start_system_ms);
+                }
+
                 play_paused = true;
                 playback_user_paused = true;
                 playback_permitted = false;

@@ -82,6 +82,10 @@ extern File cmt_file;
 
 extern volatile bool playback_started;
 
+extern volatile uint32_t playback_base_time_ms;
+extern volatile uint32_t playback_tag_start_system_ms;
+extern volatile bool playback_time_valid;
+
 extern queue_t cmt_data_queue;
 extern queue_t cmt_play_queue;
 
@@ -133,8 +137,3 @@ extern int wifi_opt_sel;
 
 extern int cmt_selected_baud_rate;
 extern int cas_selected_baud_rate;
-
-extern volatile SystemState current_state;
-extern RecMode selected_rec_mode;
-extern RemoteState current_remote_state;
-extern uint32_t remote_stable_time;

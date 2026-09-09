@@ -23,6 +23,10 @@ volatile bool playback_seeking_now = false;
 extern volatile bool play_paused;
 extern volatile bool play_active;
 
+volatile uint32_t playback_base_time_ms = 0;
+volatile uint32_t playback_tag_start_system_ms = 0;
+volatile bool playback_time_valid = false;
+
 static void drain_play_queue() {
     uint16_t dummy = 0;
     while (queue_try_remove(&cmt_play_queue, &dummy));
@@ -59,6 +63,7 @@ bool jump_playback_to_blank(int direction) {
         play_paused = false;
         play_active = true;
         playback_permitted = true;
+        playback_tag_start_system_ms = millis();  // ★時間再開
         init_core1_playback_prime();
         return false;
     }
@@ -67,12 +72,17 @@ bool jump_playback_to_blank(int direction) {
     play_paused = false;
     play_active = true;
     playback_permitted = true;
+    playback_tag_start_system_ms = millis();  // ★時間再開
 
     init_core1_playback_prime();
     return true;
 }
 
 static void complete_playback_and_stay_on_screen() {
+    if (!play_paused && playback_time_valid) {
+        playback_base_time_ms += (millis() - playback_tag_start_system_ms);
+    }
+
     play_active = false;
     play_paused = true;
     playback_permitted = false;
@@ -202,6 +212,10 @@ bool start_playback_file(const char* filename) {
 
     playback_seeking_now = false;
     drain_play_queue();
+
+    playback_base_time_ms = 0;
+    playback_tag_start_system_ms = millis();
+    playback_time_valid = true;
 
     // プレチャージ
     int secure_load_count = 0;

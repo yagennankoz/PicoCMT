@@ -247,6 +247,11 @@ bool PlayerCMT::seek(int direction, queue_t* play_queue) {
         end_reached = false;
         exhausted = false;
         set_log("CMT Seek 0");
+
+        playback_base_time_ms = 0;
+        playback_tag_start_system_ms = millis();
+        playback_time_valid = true;
+
         return true;
     } else {
         end_reached = true;

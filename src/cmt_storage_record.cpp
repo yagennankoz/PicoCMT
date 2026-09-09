@@ -52,7 +52,7 @@ static void flush_rec_buffer() {
 }
 
 /**
- * @brief ファイルからファイルへ内容をコピーするヘルパー関数
+ * @brief ファイルからファイルへ内容を安全にコピーするヘルパー関数
  */
 static bool copy_file_contents(File& dest, File& src) {
     if (!dest || !src) {
@@ -61,12 +61,12 @@ static bool copy_file_contents(File& dest, File& src) {
     uint8_t buffer[512];
     src.seek(0);
     while (src.available()) {
-        size_t bytes_read = src.read(buffer, sizeof(buffer));
-        if (bytes_read == 0) {
+        int bytes_read = src.read(buffer, sizeof(buffer));
+        if (bytes_read <= 0) {
             break;
         }
-        if (dest.write(buffer, bytes_read) != bytes_read) {
-            return false;  // 書き込み失敗
+        if (dest.write(buffer, bytes_read) != (size_t)bytes_read) {
+            return false;
         }
     }
     return true;
@@ -85,10 +85,12 @@ static String extract_names_from_file(const char* filepath) {
     int match_d3_count = 0;
     int match_p2_state = 0;
     int match_d0_count = 0;
+    int match_ea_count = 0;
     int extract_count = 0;
     char name_buf[7] = {0};
+    uint8_t cnt = 0;
 
-    while (f.available()) {
+    while (f.available() && cnt < 100) {
         uint8_t c = f.read();
 
         // 名前抽出中
@@ -187,14 +189,28 @@ static String extract_names_from_file(const char* filepath) {
             }
             match_d0_count = 0;
         }
+        // パターン3: D0 x 10以上 に続く6バイト
+        if (c == 0xEA) {
+            match_ea_count++;
+            match_p2_state = 0;
+        } else {
+            if (match_ea_count >= 10) {
+                name_buf[0] = (char)c;
+                extract_count = 5;  // 既に1文字読んだので残り5バイト
+                match_ea_count = 0;
+                match_p2_state = 0;
+                continue;
+            }
+            match_ea_count = 0;
+        }
+        cnt++;
     }
     f.close();
     return names;
 }
 
 /**
- * @brief
- * 既存のtarget_filenameの末尾に抽出した名前を付加してリネームする（APPEND用）
+ * @brief 既存のtarget_filenameの末尾に抽出した名前を付加してリネームする
  */
 static void append_names_to_target_filename(const String& names) {
     if (names.length() == 0) {
@@ -221,7 +237,7 @@ static void append_names_to_target_filename(const String& names) {
 }
 
 /**
- * @brief デフォルトのtarget_filenameを、抽出した名前にリネームする（NEW用）
+ * @brief デフォルトのtarget_filenameを抽出した名前にリネームする
  */
 static void rename_target_filename_with_extracted_names(const String& names) {
     if (names.length() == 0) {
@@ -262,12 +278,11 @@ static void rename_target_filename_with_extracted_names(const String& names) {
 }
 
 /**
- * @brief RAWファイルを指定されたフォーマットに変換し、既存のファイルに追記する
+ * @brief RAWファイルを変換し、既存のファイルに安全に追記・結合する
  */
 static bool append_converted_raw_to_file(const char* target_path,
                                          const char* raw_path,
                                          RecFormat format) {
-    // 1. フォーマットに応じてコンバータと一時ファイルパスを決定
     std::function<bool(const char*, const char*)> converter;
     const char* temp_path = nullptr;
 
@@ -276,7 +291,7 @@ static bool append_converted_raw_to_file(const char* target_path,
             converter = convert_raw_to_t88;
             temp_path = "/APPEND.T88";
             break;
-        case FMT_CAS:  // CAS追加
+        case FMT_CAS:
             converter = convert_raw_to_cas;
             temp_path = "/APPEND.CAS";
             break;
@@ -284,7 +299,7 @@ static bool append_converted_raw_to_file(const char* target_path,
             return false;
     }
 
-    // 2. RAWを一時ファイルに変換
+    // 1. RAWを一時ファイルに変換
     if (!converter(raw_path, temp_path)) {
         if (SD.exists(temp_path)) {
             SD.remove(temp_path);
@@ -294,69 +309,106 @@ static bool append_converted_raw_to_file(const char* target_path,
 
     String extracted = extract_names_from_file(temp_path);
 
-    bool success = false;
-    char backup_path[128];
-    snprintf(backup_path, sizeof(backup_path), "%s.bak", target_path);
-    if (SD.exists(backup_path)) {
-        SD.remove(backup_path);
-    }
-
-    // 3. 元ファイルをバックアップにリネーム
-    if (!SD.rename(target_path, backup_path)) {
-        SD.remove(temp_path);
-        return false;
-    }
-
-    File backup_file = SD.open(backup_path, FILE_READ);
+    File old_file = SD.open(target_path, FILE_READ);
     File new_part_file = SD.open(temp_path, FILE_READ);
-    File final_file = SD.open(target_path, FILE_WRITE);
 
-    if (backup_file && new_part_file && final_file) {
+    const char* merge_path = "/APPEND.MRG";
+    if (SD.exists(merge_path)) {
+        SD.remove(merge_path);
+    }
+    File merge_file = SD.open(merge_path, FILE_WRITE);
+
+    bool success = false;
+
+    if (old_file && new_part_file && merge_file) {
         if (format == FMT_T88) {
-            // --- T88の追記処理 ---
-            // T88のシグネチャは 24バイト固定
+            // T88の24バイト固定ヘッダをコピー
             uint8_t header[24];
-            backup_file.read(header, 24);
-            final_file.write(header, 24);
+            size_t h_read = old_file.read(header, 24);
+            if (h_read > 0) {
+                merge_file.write(header, h_read);
+            }
 
-            // 元ファイルからタグをコピー
-            while (backup_file.available()) {
+            uint32_t total_ticks = 0;
+
+            // --- 1. 既存ファイルからタグをコピーしつつ、最大ticksを記録 ---
+            while (old_file.available()) {
                 uint16_t tag_id = 0, tag_size = 0;
-                if (backup_file.read((uint8_t*)&tag_id, 2) != 2) {
+                if (old_file.read((uint8_t*)&tag_id, 2) != 2) {
                     break;
                 }
-                if (backup_file.read((uint8_t*)&tag_size, 2) != 2) {
+                if (old_file.read((uint8_t*)&tag_size, 2) != 2) {
                     break;
                 }
-
-                // ENDタグに到達したらコピーを止める（まだファイルは閉じない）
                 if (tag_id == T88_TAG_END) {
                     break;
                 }
 
-                final_file.write((uint8_t*)&tag_id, 2);
-                final_file.write((uint8_t*)&tag_size, 2);
+                merge_file.write((uint8_t*)&tag_id, 2);
+                merge_file.write((uint8_t*)&tag_size, 2);
 
+                uint32_t bytes_to_read = tag_size;
+                if (tag_id >= 0x0100 && tag_size >= 8) {
+                    uint8_t ts_buf[8];
+                    size_t read_bytes = old_file.read(ts_buf, 8);
+                    if (read_bytes == 8) {
+                        uint32_t current_tag_start =
+                            (uint32_t)ts_buf[0] | ((uint32_t)ts_buf[1] << 8) |
+                            ((uint32_t)ts_buf[2] << 16) |
+                            ((uint32_t)ts_buf[3] << 24);
+                        uint32_t current_tag_len = (uint32_t)ts_buf[4] |
+                                                   ((uint32_t)ts_buf[5] << 8) |
+                                                   ((uint32_t)ts_buf[6] << 16) |
+                                                   ((uint32_t)ts_buf[7] << 24);
+                        uint32_t end_time = current_tag_start + current_tag_len;
+                        if (end_time > total_ticks) {
+                            total_ticks = end_time;
+                        }
+                    }
+                    if (read_bytes > 0) {
+                        merge_file.write(ts_buf, read_bytes);
+                        bytes_to_read -= read_bytes;
+                    }
+                }
+
+                uint32_t remaining = bytes_to_read;
                 uint8_t buffer[256];
-                for (size_t i = 0; i < tag_size; i += sizeof(buffer)) {
-                    size_t to_read = (tag_size - i > sizeof(buffer))
+                while (remaining > 0) {
+                    size_t to_read = (remaining > sizeof(buffer))
                                          ? sizeof(buffer)
-                                         : tag_size - i;
-                    backup_file.read(buffer, to_read);
-                    final_file.write(buffer, to_read);
+                                         : remaining;
+                    int read_bytes = old_file.read(buffer, to_read);
+                    if (read_bytes <= 0) {
+                        break;
+                    }
+                    merge_file.write(buffer, read_bytes);
+                    remaining -= read_bytes;
                 }
             }
 
-            // 2秒のブランク(無音)をタグとして挿入
+            // --- 2. 約2秒のブランク(無音)をタグとして挿入し、ticksも加算 ---
             uint16_t blank_tag_id = T88_TAG_BLANK, blank_tag_size = 8;
-            uint32_t blank_start_ticks = 0, blank_len_ticks = 9600;
-            final_file.write((uint8_t*)&blank_tag_id, 2);
-            final_file.write((uint8_t*)&blank_tag_size, 2);
-            final_file.write((uint8_t*)&blank_start_ticks, 4);
-            final_file.write((uint8_t*)&blank_len_ticks, 4);
+            uint32_t blank_start_ticks = total_ticks;
+            uint32_t blank_len_ticks = 9600;
+            merge_file.write((uint8_t*)&blank_tag_id, 2);
+            merge_file.write((uint8_t*)&blank_tag_size, 2);
 
-            // 追記ファイル（新規録音分）からタグをコピー
-            new_part_file.seek(24);  // シグネチャ(24バイト)をスキップ
+            uint8_t b_ts[8];
+            b_ts[0] = blank_start_ticks & 0xFF;
+            b_ts[1] = (blank_start_ticks >> 8) & 0xFF;
+            b_ts[2] = (blank_start_ticks >> 16) & 0xFF;
+            b_ts[3] = (blank_start_ticks >> 24) & 0xFF;
+            b_ts[4] = blank_len_ticks & 0xFF;
+            b_ts[5] = (blank_len_ticks >> 8) & 0xFF;
+            b_ts[6] = (blank_len_ticks >> 16) & 0xFF;
+            b_ts[7] = (blank_len_ticks >> 24) & 0xFF;
+            merge_file.write(b_ts, 8);
+            total_ticks += blank_len_ticks;
+
+            // --- 3. 追記ファイル（新規録音分）からタグをコピー ---
+            uint8_t skip_header[24];
+            new_part_file.read(skip_header, 24);
+
             while (new_part_file.available()) {
                 uint16_t tag_id = 0, tag_size = 0;
                 if (new_part_file.read((uint8_t*)&tag_id, 2) != 2) {
@@ -366,61 +418,98 @@ static bool append_converted_raw_to_file(const char* target_path,
                     break;
                 }
 
-                // VERSIONタグは元ファイルに既にあるためスキップする
+                // VERSIONタグは既存ファイルにあるためスキップ
                 if (tag_id == T88_TAG_VERSION) {
-                    new_part_file.seek(new_part_file.position() + tag_size);
+                    uint32_t skip_rem = tag_size;
+                    while (skip_rem > 0) {
+                        new_part_file.read();
+                        skip_rem--;
+                    }
                     continue;
                 }
-
-                final_file.write((uint8_t*)&tag_id, 2);
-                final_file.write((uint8_t*)&tag_size, 2);
-
-                uint8_t buffer[256];
-                for (size_t i = 0; i < tag_size; i += sizeof(buffer)) {
-                    size_t to_read = (tag_size - i > sizeof(buffer))
-                                         ? sizeof(buffer)
-                                         : tag_size - i;
-                    new_part_file.read(buffer, to_read);
-                    final_file.write(buffer, to_read);
-                }
-
-                // ENDタグを書き終わったら完了
                 if (tag_id == T88_TAG_END) {
                     break;
                 }
+
+                merge_file.write((uint8_t*)&tag_id, 2);
+                merge_file.write((uint8_t*)&tag_size, 2);
+
+                uint32_t bytes_to_read = tag_size;
+                if (tag_id >= 0x0100 && tag_size >= 8) {
+                    uint8_t ts_buf[8];
+                    size_t read_bytes = new_part_file.read(ts_buf, 8);
+                    if (read_bytes == 8) {
+                        uint32_t current_tag_start =
+                            (uint32_t)ts_buf[0] | ((uint32_t)ts_buf[1] << 8) |
+                            ((uint32_t)ts_buf[2] << 16) |
+                            ((uint32_t)ts_buf[3] << 24);
+                        current_tag_start += total_ticks;
+                        ts_buf[0] = current_tag_start & 0xFF;
+                        ts_buf[1] = (current_tag_start >> 8) & 0xFF;
+                        ts_buf[2] = (current_tag_start >> 16) & 0xFF;
+                        ts_buf[3] = (current_tag_start >> 24) & 0xFF;
+                    }
+                    if (read_bytes > 0) {
+                        merge_file.write(ts_buf, read_bytes);
+                        bytes_to_read -= read_bytes;
+                    }
+                }
+
+                uint32_t remaining = bytes_to_read;
+                uint8_t buffer[256];
+                while (remaining > 0) {
+                    size_t to_read = (remaining > sizeof(buffer))
+                                         ? sizeof(buffer)
+                                         : remaining;
+                    int read_bytes = new_part_file.read(buffer, to_read);
+                    if (read_bytes <= 0) {
+                        break;
+                    }
+                    merge_file.write(buffer, read_bytes);
+                    remaining -= read_bytes;
+                }
             }
+
+            // --- 4. 最後に終了タグを明示的に書き込む ---
+            uint16_t end_tag_id = T88_TAG_END;
+            uint16_t end_tag_size = 0;
+            merge_file.write((uint8_t*)&end_tag_id, 2);
+            merge_file.write((uint8_t*)&end_tag_size, 2);
+
             success = true;
 
         } else {
-            // CMT / CAS 等の単純連結可能なフォーマット
-            if (copy_file_contents(final_file, backup_file)) {
-                success = copy_file_contents(final_file, new_part_file);
+            // CMT / CAS 等の単純連結
+            if (copy_file_contents(merge_file, old_file)) {
+                success = copy_file_contents(merge_file, new_part_file);
             }
         }
+        merge_file.flush();
     }
 
-    if (backup_file) {
-        backup_file.close();
+    if (old_file) {
+        old_file.close();
     }
     if (new_part_file) {
         new_part_file.close();
     }
-    if (final_file) {
-        final_file.close();
+    if (merge_file) {
+        merge_file.close();
     }
 
+    // SDのキャッシュフラッシュを確実に待つ
+    delay(50);
+
     if (success) {
-        SD.remove(backup_path);
+        SD.remove(target_path);
+        SD.rename(merge_path, target_path);
 
         if (extracted.length() > 0) {
             append_names_to_target_filename(extracted);
         }
     } else {
-        // 失敗した場合はバックアップを元に戻す
-        if (SD.exists(target_path)) {
-            SD.remove(target_path);
-        }
-        SD.rename(backup_path, target_path);
+        // 失敗時はマージ用のゴミファイルを消すだけ
+        SD.remove(merge_path);
     }
 
     SD.remove(temp_path);
@@ -507,7 +596,7 @@ void stop_raw_recording_and_finalize() {
             case FMT_CMT:
                 converter = convert_raw_to_cmt;
                 break;
-            case FMT_CAS:  // CAS追加
+            case FMT_CAS:
                 converter = convert_raw_to_cas;
                 break;
             default:

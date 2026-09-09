@@ -65,12 +65,6 @@ static const uint8_t PROGMEM reel_bmp_3[] = {
 static const uint8_t* reel_bmps[4] = {reel_bmp_0, reel_bmp_1, reel_bmp_2,
                                       reel_bmp_3};
 
-/**
- * @brief カセットテープのアニメーションを描画する共通関数
- * @param x 描画位置X
- * @param y 描画位置Y
- * @param is_playing trueならリールが回転する
- */
 static void draw_cassette_animation(int x, int y, bool is_playing) {
     static uint32_t anim_last_ms = 0;
     static int current_frame = 0;
@@ -246,6 +240,28 @@ static void render_playback_screen_to_oled() {
 
     bool is_playing = (current_state == STATE_PLAYING && !playback_user_paused);
     draw_cassette_animation(0, 38, is_playing);
+
+    if (playback_time_valid) {
+        uint32_t current_play_ms = 0;
+        if (is_playing) {
+            current_play_ms = playback_base_time_ms +
+                              (millis() - playback_tag_start_system_ms);
+        } else {
+            current_play_ms = playback_base_time_ms;
+        }
+
+        uint32_t total_sec = current_play_ms / 1000;
+        uint32_t m = total_sec / 60;
+        uint32_t s = total_sec % 60;
+
+        char time_str[10];
+        snprintf(time_str, sizeof(time_str), "%02lu:%02lu", m, s);
+
+        oled.setCursor(52, 40);
+        oled.setTextSize(2);
+        oled.print(time_str);
+        oled.setTextSize(1);
+    }
 
     oled.display();
 }

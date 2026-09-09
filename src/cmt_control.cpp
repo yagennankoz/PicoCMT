@@ -1,6 +1,3 @@
-// ============================================================================
-// cmt_control.cpp (すべて上書き)
-// ============================================================================
 #include "cmt_control.h"
 
 #include <Arduino.h>
@@ -16,11 +13,20 @@ static bool remote_hardware_on = false;
 void update_system_run_permissions() {
     if (current_state == STATE_PLAYING || current_state == STATE_PLAY_STANDBY) {
         if (remote_hardware_on || manual_ok_override) {
+            // 再生再開時にシステムタイマーの起点を取り直す
+            if (play_paused) {
+                playback_tag_start_system_ms = millis();
+            }
             playback_permitted = true;
             play_paused = false;
             current_state = STATE_PLAYING;
             playback_started = true;
         } else {
+            // リモートオフ時に停止するまでの経過時間を加算
+            if (!play_paused && playback_time_valid) {
+                playback_base_time_ms +=
+                    (millis() - playback_tag_start_system_ms);
+            }
             playback_permitted = false;
             play_paused = true;
             if (current_state == STATE_PLAYING) {
@@ -65,21 +71,30 @@ void scan_remote_hardware() {
     if (target_state != current_remote_state) {
         if (remote_stable_time == 0) {
             remote_stable_time = now;
-        } else if (now - remote_stable_time > DEBOUNCE_MS) {
-            current_remote_state = target_state;
-            remote_stable_time = 0;
+        } else {
+            // チャタリング対策: ON時はボタンと同じ(DEBOUNCE_MS)速度で反応し、
+            // OFF時はノイズとリレーのバタつきを無視するため 500ms
+            // 間連続で安定するのを待つ
+            uint32_t required_stable_time =
+                (target_state == REMOTE_OFF) ? 500 : DEBOUNCE_MS;
 
-            if (current_remote_state == REMOTE_ON) {
-                remote_hardware_on = true;
-            } else {
-                remote_hardware_on = false;
-                if (manual_ok_override) {
-                    manual_ok_override = false;
+            if (now - remote_stable_time > required_stable_time) {
+                current_remote_state = target_state;
+                remote_stable_time = 0;
+
+                if (current_remote_state == REMOTE_ON) {
+                    remote_hardware_on = true;
+                } else {
+                    remote_hardware_on = false;
+                    if (manual_ok_override) {
+                        manual_ok_override = false;
+                    }
                 }
+                update_system_run_permissions();
             }
-            update_system_run_permissions();
         }
     } else {
+        // 状態が一致（安定）している場合はタイマーをリセット
         remote_stable_time = 0;
     }
 }

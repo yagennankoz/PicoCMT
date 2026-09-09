@@ -254,6 +254,11 @@ bool PlayerCAS::seek(int direction, queue_t* play_queue) {
         // 先頭に戻った際もウィンドウを再読み込みする
         window_filled = buffered_reader->read(window, 8);
         set_log("CAS Seek 0");
+
+        playback_base_time_ms = 0;
+        playback_tag_start_system_ms = millis();
+        playback_time_valid = true;
+
         return true;
     } else {
         end_reached = true;

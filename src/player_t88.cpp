@@ -184,7 +184,6 @@ void PlayerT88::get_status(PlaybackStatus* out) {
             : (millis() - playback_queue_last_progress_ms);
     out->file_position =
         buffered_reader ? buffered_reader->display_position() : 0;
-    Serial.printf("pos:%ld\n", out->file_position);
     out->file_size = cmt_file ? cmt_file->size() : 0;
     snprintf(out->playback_log, sizeof(out->playback_log), "%s",
              playback_last_log);
@@ -393,6 +392,7 @@ void PlayerT88::fill_queue(queue_t* q) {
             if (!playback_lock_start_ticks) {
                 playback_current_start_ticks = start_ticks;
             }
+
             if (tag_size > 8) {
                 if (!skip_bytes(tag_size - 8)) {
                     playback_t88_end_reached = true;
@@ -586,13 +586,30 @@ bool PlayerT88::seek(int direction, queue_t* q) {
     }
 
     uint32_t target_start_ticks = 0;
-    if (buffered_reader->seek(target_pos + 4)) {
-        read_u32_le(&target_start_ticks);
+
+    // 先頭巻き戻し時は無条件で0にリセット。
+    // それ以外の場合は時間タグか判定してからTicksを取得する。
+    if (target_pos == 24) {
+        target_start_ticks = 0;
+    } else {
+        uint16_t tag_id = 0, tag_size = 0;
+        if (read_u16_le(&tag_id) && read_u16_le(&tag_size)) {
+            if (tag_id >= 0x0100 && tag_size >= 8) {
+                read_u32_le(&target_start_ticks);
+            }
+        }
     }
+
+    // タグヘッダ確認後にシーク先へポインタを戻す
     buffered_reader->seek(target_pos);
 
     playback_current_start_ticks = target_start_ticks;
     playback_lock_start_ticks = true;
+
+    playback_base_time_ms =
+        (uint32_t)(((uint64_t)target_start_ticks * 1000ULL) / 4800ULL);
+    playback_tag_start_system_ms = millis();
+    playback_time_valid = true;
 
     playback_t88_end_reached = false;
     playback_source_exhausted = false;
