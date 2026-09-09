@@ -1,3 +1,5 @@
+![PicoCMT](./image/PicoCMTimage.jpg)
+
 # PicoCmt - 8bit PC用 CMT(カセット磁気テープ) エミュレータ
 
 Raspberry Pi Pico W を使用した、8bitレトロPC向けのカセット磁気テープ（CMT）エミュレータです。
