@@ -13,7 +13,6 @@
 #include "pico/util/queue.h"
 #include "player_cas.h"
 #include "player_cmt.h"
-#include "player_p6.h"
 #include "player_t77.h"
 #include "player_t88.h"
 
@@ -190,11 +189,10 @@ bool start_playback_file(const char* filename) {
             ((PlayerCAS*)active_player)->set_baud_rate(cas_selected_baud_rate);
         } else if (strcasecmp(ext, ".T77") == 0) {
             active_player = new PlayerT77();
-        } else if (strcasecmp(ext, ".CMT") == 0) {
+        } else if (strcasecmp(ext, ".CMT") == 0 ||
+                   strcasecmp(ext, ".P6") == 0) {
             active_player = new PlayerCMT();
             ((PlayerCMT*)active_player)->set_baud_rate(cmt_selected_baud_rate);
-        } else if (strcasecmp(ext, ".P6") == 0) {
-            active_player = new PlayerP6();
         }
     }
 

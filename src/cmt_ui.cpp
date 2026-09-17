@@ -304,7 +304,7 @@ void render_wifi_menu_to_oled() {
     oled.setCursor(0, y2);
     oled.print(wifi_menu_cursor == 2 ? ">" : " ");
     oled.print(" Rec Fmt: ");
-    const char* fmt_names[] = {"T88", "CMT", "CAS"};  // CASを追加
+    const char* fmt_names[] = {"T88", "CMT", "CAS", "P6"};
 
     // 安全装置: 万が一未定義のフォーマットが設定されていた場合はT88に戻す
     if (default_rec_fmt >= 3) {
@@ -483,13 +483,14 @@ void render_file_browser_to_oled() {
         draw_marquee_text(24, y_pos, 17, item.name, item_idx == current_cursor);
     }
 
-    // CMTまたはCASファイル選択時のボーレート選択領域描画
+    // CMT/P6/CASファイル選択時のボーレート選択領域描画
     if (total_items > 0 && !file_list[current_cursor].is_dir) {
         const char* ext = strrchr(file_list[current_cursor].name, '.');
         bool is_cmt = (ext && strcasecmp(ext, ".CMT") == 0);
         bool is_cas = (ext && strcasecmp(ext, ".CAS") == 0);
+        bool is_p6 = (ext && strcasecmp(ext, ".P6") == 0);
 
-        if (is_cmt || is_cas) {
+        if (is_cmt || is_cas || is_p6) {
             int cursor_on_screen = current_cursor - scroll_offset;
             int ui_line = (cursor_on_screen == 0)   ? 2
                           : (cursor_on_screen == 1) ? 3
@@ -509,7 +510,7 @@ void render_file_browser_to_oled() {
             // ボーレート数字の描画（サイズ2に拡大）
             oled.setTextSize(2);
             oled.setCursor(ui_x + 4, ui_y + 3);
-            if (is_cmt) {
+            if (is_cmt || is_p6) {  // P6 は CMT とボーレート設定を共用
                 if (cmt_selected_baud_rate == 1200) {
                     oled.print("1200");
                 } else {
@@ -522,13 +523,11 @@ void render_file_browser_to_oled() {
                     oled.print("2400");
                 }
             }
-            oled.setTextSize(1);  // 描画後に元のサイズに戻す
+            oled.setTextSize(1);
 
-            // 左右の操作ガイド（三角矢印風）- 黒枠のさらに外側に配置
             oled.drawPixel(ui_x - 4, ui_y + 10, SSD1306_WHITE);
             oled.drawLine(ui_x - 3, ui_y + 8, ui_x - 3, ui_y + 12,
                           SSD1306_WHITE);
-
             oled.drawPixel(ui_x + ui_w + 3, ui_y + 10, SSD1306_WHITE);
             oled.drawLine(ui_x + ui_w + 2, ui_y + 8, ui_x + ui_w + 2, ui_y + 12,
                           SSD1306_WHITE);

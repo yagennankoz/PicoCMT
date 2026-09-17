@@ -131,13 +131,9 @@ static char rotate_pin_digit(char current, int step) {
 
 static void build_default_record_filename() {
     char candidate[sizeof(target_filename)] = {0};
-    const char* ext_list[] = {
-        ".T88", ".CMT", ".CAS"  // CASを追加
-        //        , ".T77"
-        //        , ".P6"
-    };
+    const char* ext_list[] = {".T88", ".CMT", ".CAS", ".P6"};
 
-    if (default_rec_fmt >= 3) {
+    if (default_rec_fmt >= 4) {
         default_rec_fmt = FMT_T88;
     }
     const char* ext = ext_list[default_rec_fmt];
@@ -171,6 +167,7 @@ void handle_file_browser_input() {
 
     bool is_cmt_selected = false;
     bool is_cas_selected = false;
+    bool is_p6_selected = false;
     if (total_items > 0 && !file_list[current_cursor].is_dir) {
         const char* ext = strrchr(file_list[current_cursor].name, '.');
         if (ext) {
@@ -180,19 +177,22 @@ void handle_file_browser_input() {
             if (strcasecmp(ext, ".CAS") == 0) {
                 is_cas_selected = true;
             }
+            if (strcasecmp(ext, ".P6") == 0) {
+                is_p6_selected = true;
+            }
         }
     }
 
-    if ((is_cmt_selected || is_cas_selected) &&
+    if ((is_cmt_selected || is_cas_selected || is_p6_selected) &&
         (btn_trigger_clicked[IDX_LEFT] || btn_trigger_clicked[IDX_RIGHT] ||
          btn_trigger_repeat[IDX_LEFT] || btn_trigger_repeat[IDX_RIGHT])) {
-        // 左右キーのイベントを消費
         btn_trigger_clicked[IDX_LEFT] = false;
         btn_trigger_clicked[IDX_RIGHT] = false;
         btn_trigger_repeat[IDX_LEFT] = false;
         btn_trigger_repeat[IDX_RIGHT] = false;
 
-        if (is_cmt_selected) {
+        // P6 と CMT は設定を共用
+        if (is_cmt_selected || is_p6_selected) {
             cmt_selected_baud_rate =
                 (cmt_selected_baud_rate == 1200) ? 600 : 1200;
         } else if (is_cas_selected) {
@@ -313,6 +313,7 @@ void handle_file_browser_input() {
                 // 追記対応フォーマットなら、メニュー表示フラグを立てる
                 if (strcasecmp(ext, ".T88") == 0 ||
                     strcasecmp(ext, ".T77") == 0 ||
+                    strcasecmp(ext, ".P6") == 0 ||
                     strcasecmp(ext, ".CAS") == 0) {
                     should_show_rec_menu = true;
                 }
@@ -466,7 +467,7 @@ void handle_wifi_menu_input() {
             if (default_rec_fmt > 0) {
                 default_rec_fmt = (RecFormat)(default_rec_fmt - 1);
             } else {
-                default_rec_fmt = (RecFormat)(2);  // CAS(2)へループ
+                default_rec_fmt = (RecFormat)(3);  // ★ P6(3)へループ
             }
             save_rec_format_to_eeprom();
             oled_need_refresh = true;
@@ -474,8 +475,7 @@ void handle_wifi_menu_input() {
         if (btn_trigger_clicked[IDX_RIGHT] || btn_trigger_repeat[IDX_RIGHT]) {
             btn_trigger_clicked[IDX_RIGHT] = false;
             btn_trigger_repeat[IDX_RIGHT] = false;
-            default_rec_fmt =
-                (RecFormat)((default_rec_fmt + 1) % 3);  // CAS(2)までループ
+            default_rec_fmt = (RecFormat)((default_rec_fmt + 1) % 4);
             save_rec_format_to_eeprom();
             oled_need_refresh = true;
         }

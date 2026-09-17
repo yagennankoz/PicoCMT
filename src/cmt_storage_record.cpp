@@ -189,6 +189,7 @@ static String extract_names_from_file(const char* filepath) {
             }
             match_d0_count = 0;
         }
+
         // パターン3: D0 x 10以上 に続く6バイト
         if (c == 0xEA) {
             match_ea_count++;
@@ -294,6 +295,10 @@ static bool append_converted_raw_to_file(const char* target_path,
         case FMT_CAS:
             converter = convert_raw_to_cas;
             temp_path = "/APPEND.CAS";
+            break;
+        case FMT_P6:
+            converter = convert_raw_to_cmt;
+            temp_path = "/APPEND.P6";
             break;
         default:
             return false;
@@ -479,7 +484,7 @@ static bool append_converted_raw_to_file(const char* target_path,
             success = true;
 
         } else {
-            // CMT / CAS 等の単純連結
+            // CMT / CAS / P6 等の単純連結
             if (copy_file_contents(merge_file, old_file)) {
                 success = copy_file_contents(merge_file, new_part_file);
             }
@@ -508,7 +513,7 @@ static bool append_converted_raw_to_file(const char* target_path,
             append_names_to_target_filename(extracted);
         }
     } else {
-        // 失敗時はマージ用のゴミファイルを消すだけ
+        // 失敗時はマージ用ファイルを消すだけ
         SD.remove(merge_path);
     }
 
@@ -598,6 +603,9 @@ void stop_raw_recording_and_finalize() {
                 break;
             case FMT_CAS:
                 converter = convert_raw_to_cas;
+                break;
+            case FMT_P6:
+                converter = convert_raw_to_cmt;
                 break;
             default:
                 converter = nullptr;

@@ -36,8 +36,8 @@ typedef enum {
     FMT_T88 = 0,
     FMT_CMT,
     FMT_CAS,
+    FMT_P6,
     //    FMT_T77,
-    //    FMT_P6,
     FMT_MAX
 } RecFormat;
 
