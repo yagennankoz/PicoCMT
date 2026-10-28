@@ -13,5 +13,5 @@ void render_wifi_menu_to_oled();
 void render_rec_menu_to_oled();
 void render_file_browser_to_oled();
 void render_wifi_config_to_oled();
-void render_wifi_pin_to_oled();
+void render_web_pass_config_to_oled();
 void render_wifi_connect_error_to_oled();

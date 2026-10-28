@@ -6,7 +6,7 @@ from t88_widgets import DumpTextArea
 class T88GuiDumper(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("レトロPC テープイメージ アナライザー (T88 / CAS / CMT)")
+        self.title("レトロPC テープイメージ アナライザー (T88 / CAS / CMT / T77)")
         self.geometry("1280x780")
 
         self.parser = TapeImageParser()
@@ -32,7 +32,7 @@ class T88GuiDumper(tk.Tk):
 
         # タブA: T88 / CAS 共通構造解析
         self.tab_t88 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_t88, text=" T88/CAS 構造解析ビュー ")
+        self.notebook.add(self.tab_t88, text=" T88/CAS/T77 構造解析ビュー ")
         t88_paned = ttk.PanedWindow(self.tab_t88, orient=tk.HORIZONTAL)
         t88_paned.pack(expand=True, fill=tk.BOTH, padx=5, pady=5)
 
@@ -56,6 +56,7 @@ class T88GuiDumper(tk.Tk):
 
         self.tree.tag_configure("tag_data", background="#70f7a0")
         self.tree.tag_configure("tag_blank", background="#a5a5a5")
+        self.tree.tag_configure("tag_error", background="#f7a0a0")
 
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
@@ -92,6 +93,19 @@ class T88GuiDumper(tk.Tk):
 
         self.txt_full_dump.bind("<ButtonRelease-1>", self.on_full_dump_clicked)
 
+        # タブC: T77 チェック結果
+        self.tab_t77 = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_t77, text=" T77 チェック結果 ")
+
+        t77_scroll = ttk.Scrollbar(self.tab_t77, orient=tk.VERTICAL)
+        t77_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.txt_t77_report = tk.Text(self.tab_t77, font=("Consolas", 10), wrap=tk.NONE, bg="#fafafa")
+        self.txt_t77_report.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+
+        self.txt_t77_report.config(yscrollcommand=t77_scroll.set)
+        t77_scroll.config(command=self.txt_t77_report.yview)
+
         # 4. 下側ステータス解析ペイン
         bottom_frame = ttk.Frame(main_paned, padding=5)
         main_paned.add(bottom_frame, weight=1)
@@ -99,7 +113,7 @@ class T88GuiDumper(tk.Tk):
         self.txt_status_analysis.pack(expand=True, fill=tk.BOTH)
 
     def open_file(self):
-        file_path = filedialog.askopenfilename(filetypes=[("Tape Image", "*.t88 *.cmt *.cas"), ("All Files", "*.*")])
+        file_path = filedialog.askopenfilename(filetypes=[("Tape Image", "*.t88 *.cmt *.cas *.t77"), ("All Files", "*.*")])
         if not file_path: return
 
         try:
@@ -114,8 +128,14 @@ class T88GuiDumper(tk.Tk):
         self.txt_tag_dump.delete("1.0", tk.END)
         self.txt_full_dump.delete("1.0", tk.END)
         self.txt_status_analysis.delete("1.0", tk.END)
+        self.txt_t77_report.delete("1.0", tk.END)
 
         self.txt_full_dump.insert(tk.END, self.parser.generate_hex_dump_string(self.parser.file_data))
+
+        if self.parser.is_t77_mode:
+            self.txt_t77_report.insert(tk.END, self.parser.t77.report)
+        else:
+            self.txt_t77_report.insert(tk.END, "T77ファイルではありません。")
 
         if self.parser.is_cmt_mode:
             # 構造が無いCMTファイル
@@ -134,7 +154,10 @@ class T88GuiDumper(tk.Tk):
             self.lbl_tag_detail.config(text="選択されたブロックのデータ部バイナリ")
             for t in self.parser.tags_info:
                 row_tags = ()
-                if t.get('is_cas'):
+                if t.get('is_t77'):
+                    row_tags = {"ok": ("tag_data",), "gap": ("tag_blank",),
+                                "error": ("tag_error",)}.get(t['row_class'], ())
+                elif t.get('is_cas'):
                     row_tags = ("tag_data",) if t['tag_id'] == 0xCA51 else ("tag_blank",)
                 else:
                     if t['tag_id'] == 0x0101:
@@ -145,6 +168,14 @@ class T88GuiDumper(tk.Tk):
                 self.tree.insert("", tk.END, values=(
                     t["no"], f"0x{t['offset']:08X}", f"0x{t['tag_id']:04X}", t["tag_name"], f"{t['data_len']} B",
                     f"{t['start_tick']:,}", f"{t['duration_ticks']:,}", f"{t['ms']:.1f}", t["pure_bytes"]), tags=row_tags)
+
+            if self.parser.is_t77_mode:
+                # T77はまずチェック結果を見せる
+                self.notebook.select(self.tab_t77)
+                self.txt_status_analysis.insert(tk.END,
+                                                f"ファイル形式: T77 (FM-7 / XM7)  判定: {self.parser.t77.verdict()}\n"
+                                                f"詳細は「T77 チェック結果」タブを参照してください。\n"
+                                                f"構造解析ビューの行を選択すると、そのブロックのデコード結果を表示します。")
 
     def on_tag_selected(self, event):
         if self.is_updating_selection or self.parser.is_cmt_mode: return
@@ -157,11 +188,17 @@ class T88GuiDumper(tk.Tk):
         # T88の場合は4バイト、CASの場合は8バイトのヘッダ領域をスキップしてデータのみを抽出
         data_start = t_meta['offset'] + t_meta.get('header_len', 4)
         tag_data = self.parser.file_data[data_start: data_start + t_meta['data_len']]
+        detail_text = f"選択されたブロックのデータ部バイナリ"
+
+        # T77は波形データなので、デコードしたバイト列を表示する
+        if t_meta.get('is_t77'):
+            tag_data = t_meta['decoded'] or b""
+            detail_text = "選択された区間のデコード結果 (01 3C 以降)" if t_meta['tag_id'] == 0x7701 \
+                else "選択された区間のデコード結果"
 
         self.txt_tag_dump.delete("1.0", tk.END)
         self.txt_tag_dump.insert(tk.END, self.parser.generate_hex_dump_string(tag_data))
 
-        detail_text = f"選択されたブロックのデータ部バイナリ"
         if (t_meta['tag_id'] == 0x0101 or t_meta.get('is_cas')) and t_meta.get('baud_rate'):
             detail_text += f" ｜ ボーレート: {t_meta['baud_rate']}"
 
@@ -217,6 +254,16 @@ class T88GuiDumper(tk.Tk):
         )
         if clicked_offset is not None:
             text += f"クリック位置      : 0x{clicked_offset:08X} (10進数: {clicked_offset:,} バイト目)\n"
+
+        if t_meta.get('is_t77'):
+            text += (
+                f"開始オフセット    : 0x{t_meta['offset']:08X} (10進数: {t_meta['offset']:,} バイト目)\n"
+                f"区間サイズ        : {t_meta['total_len']:,} バイト ({t_meta['total_len'] // 2:,} ワード)\n"
+                f"開始時間 (カウント): {t_meta['start_tick']:,}\n"
+                f"継続時間 (カウント): {t_meta['duration_ticks']:,} (約 {t_meta['ms']:.2f} ミリ秒)\n"
+                f"{t_meta['detail']}"
+            )
+            return text
 
         text += (
             f"開始オフセット    : 0x{t_meta['offset']:08X} (10進数: {t_meta['offset']:,} バイト目)\n"

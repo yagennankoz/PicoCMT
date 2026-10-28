@@ -16,6 +16,7 @@ class PlayerCMT : public CmtPlayer {
         STATE_MARK_CARRIER,
         STATE_DUMMY_DATA,
         STATE_DATA,
+        STATE_MID_LEADER,  // ヘッダ (D3 x10 / "$$$" + ファイル名) とデータの間のピー音
         STATE_TRAILER_MARK,
         STATE_END
     };
@@ -36,6 +37,16 @@ class PlayerCMT : public CmtPlayer {
     uint32_t start_ms;
 
     int baud_rate;
+
+    // ヘッダ (D3 x10 / "$$$" + ファイル名) の検出
+    bool p6_mode;
+    int hdr_d3_run;          // 続けて出した D3 の数
+    int hdr_dollar_run;      // 続けて出した 24 ('$') の数
+    bool hdr_prev_zero;      // 前のバイトが 00 (またはファイルの先頭)
+    int hdr_name_left;       // ヘッダのファイル名の残りバイト数 (-1 = ヘッダの外)
+    bool mid_leader_pending; // 次のバイトの前にピー音を入れる
+    void track_header(uint8_t b);
+    void reset_header_tracking();
 
     bool enqueue_pulse(queue_t* q, uint16_t us);
     void set_log(const char* text);

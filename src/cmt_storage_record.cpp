@@ -9,6 +9,9 @@
 #include "cmt_cas_converter.h"
 #include "cmt_cmt_converter.h"
 #include "cmt_globals.h"
+#include "cmt_p6t_converter.h"
+#include "cmt_t77_converter.h"
+#include "cmt_t77_format.h"
 #include "cmt_t88_converter.h"
 #include "cmt_ui.h"
 #include "pico/util/queue.h"
@@ -54,12 +57,12 @@ static void flush_rec_buffer() {
 /**
  * @brief ファイルからファイルへ内容を安全にコピーするヘルパー関数
  */
-static bool copy_file_contents(File& dest, File& src) {
+static bool copy_file_contents(File& dest, File& src, uint32_t start = 0) {
     if (!dest || !src) {
         return false;
     }
     uint8_t buffer[512];
-    src.seek(0);
+    src.seek(start);
     while (src.available()) {
         int bytes_read = src.read(buffer, sizeof(buffer));
         if (bytes_read <= 0) {
@@ -70,6 +73,63 @@ static bool copy_file_contents(File& dest, File& src) {
         }
     }
     return true;
+}
+
+/**
+ * @brief 抽出したファイル名(len バイト)をファイル名に使える形に整え、names
+ * に重複なく "_" 区切りで追加する
+ */
+static void add_extracted_name(String& names, const char* raw, int len) {
+    char name_buf[T77_NAME_LEN + 1] = {0};
+    if (len > T77_NAME_LEN) {
+        len = T77_NAME_LEN;
+    }
+    memcpy(name_buf, raw, len);
+
+    // 不正文字をアンダースコアに置換
+    for (int i = 0; i < len; i++) {
+        char ch = name_buf[i];
+        if (ch < 0x20 || ch > 0x7E || ch == '/' || ch == '\\' || ch == ':' ||
+            ch == '*' || ch == '?' || ch == '"' || ch == '<' || ch == '>' ||
+            ch == '|') {
+            name_buf[i] = '_';
+        }
+    }
+    // 末尾のスペースとアンダースコアを削除
+    for (int i = len - 1; i >= 0; i--) {
+        if (name_buf[i] == ' ' || name_buf[i] == '_') {
+            name_buf[i] = '\0';
+        } else {
+            break;
+        }
+    }
+
+    if (strlen(name_buf) == 0) {
+        return;
+    }
+    String new_name = String(name_buf);
+    // 重複チェック
+    if (names == new_name || names.startsWith(new_name + "_") ||
+        names.endsWith("_" + new_name) ||
+        names.indexOf("_" + new_name + "_") != -1) {
+        return;
+    }
+    if (names.length() > 0) {
+        names += "_";
+    }
+    names += new_name;
+}
+
+/**
+ * @brief T77変換時にヘッダブロックから拾ったファイル名を連結する
+ */
+static String names_from_t77_headers() {
+    String names = "";
+    const T77HeaderNames& found = t77_last_header_names();
+    for (int i = 0; i < found.count; i++) {
+        add_extracted_name(names, found.name[i], T77_NAME_LEN);
+    }
+    return names;
 }
 
 /**
@@ -98,45 +158,7 @@ static String extract_names_from_file(const char* filepath) {
             name_buf[6 - extract_count] = (char)c;
             extract_count--;
             if (extract_count == 0) {
-                // 不正文字をアンダースコアに置換
-                for (int i = 0; i < 6; i++) {
-                    char ch = name_buf[i];
-                    if (ch < 0x20 || ch > 0x7E || ch == '/' || ch == '\\' ||
-                        ch == ':' || ch == '*' || ch == '?' || ch == '"' ||
-                        ch == '<' || ch == '>' || ch == '|') {
-                        name_buf[i] = '_';
-                    }
-                }
-                // 末尾のスペースとアンダースコアを削除
-                for (int i = 5; i >= 0; i--) {
-                    if (name_buf[i] == ' ' || name_buf[i] == '_') {
-                        name_buf[i] = '\0';
-                    } else {
-                        break;
-                    }
-                }
-
-                if (strlen(name_buf) > 0) {
-                    String new_name = String(name_buf);
-                    // 重複チェック
-                    bool exists = false;
-                    if (names == new_name) {
-                        exists = true;
-                    } else if (names.startsWith(new_name + "_")) {
-                        exists = true;
-                    } else if (names.endsWith("_" + new_name)) {
-                        exists = true;
-                    } else if (names.indexOf("_" + new_name + "_") != -1) {
-                        exists = true;
-                    }
-
-                    if (!exists) {
-                        if (names.length() > 0) {
-                            names += "_";
-                        }
-                        names += new_name;
-                    }
-                }
+                add_extracted_name(names, name_buf, 6);
             }
             continue;
         }
@@ -279,6 +301,34 @@ static void rename_target_filename_with_extracted_names(const String& names) {
 }
 
 /**
+ * @brief 追記先ファイルの拡張子から、追記するデータの形式を決める
+ * (追記できるのは T88 / T77 / CAS / P6T)
+ */
+static bool append_format_from_filename(const char* path, RecFormat* out) {
+    const char* ext = strrchr(path, '.');
+    if (ext == nullptr) {
+        return false;
+    }
+    if (strcasecmp(ext, ".T88") == 0) {
+        *out = FMT_T88;
+    } else if (strcasecmp(ext, ".T77") == 0) {
+        *out = FMT_T77;
+    } else if (strcasecmp(ext, ".CAS") == 0) {
+        *out = FMT_CAS;
+    } else if (strcasecmp(ext, ".P6T") == 0) {
+        *out = FMT_P6T;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool is_appendable_filename(const char* path) {
+    RecFormat fmt;
+    return path != nullptr && append_format_from_filename(path, &fmt);
+}
+
+/**
  * @brief RAWファイルを変換し、既存のファイルに安全に追記・結合する
  */
 static bool append_converted_raw_to_file(const char* target_path,
@@ -300,6 +350,14 @@ static bool append_converted_raw_to_file(const char* target_path,
             converter = convert_raw_to_cmt;
             temp_path = "/APPEND.P6";
             break;
+        case FMT_T77:
+            converter = convert_raw_to_t77;
+            temp_path = "/APPEND.T77";
+            break;
+        case FMT_P6T:
+            converter = convert_raw_to_p6t;
+            temp_path = "/APPEND.P6T";
+            break;
         default:
             return false;
     }
@@ -312,7 +370,9 @@ static bool append_converted_raw_to_file(const char* target_path,
         return false;
     }
 
-    String extracted = extract_names_from_file(temp_path);
+    // T77は波形データなので、変換時にヘッダブロックから拾った名前を使う
+    String extracted = (format == FMT_T77) ? names_from_t77_headers()
+                                           : extract_names_from_file(temp_path);
 
     File old_file = SD.open(target_path, FILE_READ);
     File new_part_file = SD.open(temp_path, FILE_READ);
@@ -326,162 +386,25 @@ static bool append_converted_raw_to_file(const char* target_path,
     bool success = false;
 
     if (old_file && new_part_file && merge_file) {
-        if (format == FMT_T88) {
-            // T88の24バイト固定ヘッダをコピー
-            uint8_t header[24];
-            size_t h_read = old_file.read(header, 24);
-            if (h_read > 0) {
-                merge_file.write(header, h_read);
+        if (format == FMT_P6T || format == FMT_T88) {
+            // P6T はベタイメージとフッタのブロック情報を、T88 はタグを結合する
+            // (ファイル名で開き直す)
+            old_file.close();
+            new_part_file.close();
+            merge_file.close();
+            success = (format == FMT_P6T) ? p6t_append(target_path, temp_path, merge_path)
+                                          : t88_append(target_path, temp_path, merge_path);
+        } else if (format == FMT_T77) {
+            // T77用のマージ処理（ヘッダの二重化を防ぐ）
+            // 既存ファイルをヘッダごとコピーし、追加分はヘッダとその直後の 0x0000 を
+            // 除いたデータ部を結合する (境界にカウント0のワードは入れない)
+            uint8_t header[T77_HEADER_LEN];
+            if (old_file.read(header, T77_HEADER_LEN) == T77_HEADER_LEN &&
+                memcmp(header, T77_HEADER_STR, T77_HEADER_LEN) == 0) {
+                success =
+                    copy_file_contents(merge_file, old_file) &&
+                    copy_file_contents(merge_file, new_part_file, T77_DATA_OFFSET);
             }
-
-            uint32_t total_ticks = 0;
-
-            // --- 1. 既存ファイルからタグをコピーしつつ、最大ticksを記録 ---
-            while (old_file.available()) {
-                uint16_t tag_id = 0, tag_size = 0;
-                if (old_file.read((uint8_t*)&tag_id, 2) != 2) {
-                    break;
-                }
-                if (old_file.read((uint8_t*)&tag_size, 2) != 2) {
-                    break;
-                }
-                if (tag_id == T88_TAG_END) {
-                    break;
-                }
-
-                merge_file.write((uint8_t*)&tag_id, 2);
-                merge_file.write((uint8_t*)&tag_size, 2);
-
-                uint32_t bytes_to_read = tag_size;
-                if (tag_id >= 0x0100 && tag_size >= 8) {
-                    uint8_t ts_buf[8];
-                    size_t read_bytes = old_file.read(ts_buf, 8);
-                    if (read_bytes == 8) {
-                        uint32_t current_tag_start =
-                            (uint32_t)ts_buf[0] | ((uint32_t)ts_buf[1] << 8) |
-                            ((uint32_t)ts_buf[2] << 16) |
-                            ((uint32_t)ts_buf[3] << 24);
-                        uint32_t current_tag_len = (uint32_t)ts_buf[4] |
-                                                   ((uint32_t)ts_buf[5] << 8) |
-                                                   ((uint32_t)ts_buf[6] << 16) |
-                                                   ((uint32_t)ts_buf[7] << 24);
-                        uint32_t end_time = current_tag_start + current_tag_len;
-                        if (end_time > total_ticks) {
-                            total_ticks = end_time;
-                        }
-                    }
-                    if (read_bytes > 0) {
-                        merge_file.write(ts_buf, read_bytes);
-                        bytes_to_read -= read_bytes;
-                    }
-                }
-
-                uint32_t remaining = bytes_to_read;
-                uint8_t buffer[256];
-                while (remaining > 0) {
-                    size_t to_read = (remaining > sizeof(buffer))
-                                         ? sizeof(buffer)
-                                         : remaining;
-                    int read_bytes = old_file.read(buffer, to_read);
-                    if (read_bytes <= 0) {
-                        break;
-                    }
-                    merge_file.write(buffer, read_bytes);
-                    remaining -= read_bytes;
-                }
-            }
-
-            // --- 2. 約2秒のブランク(無音)をタグとして挿入し、ticksも加算 ---
-            uint16_t blank_tag_id = T88_TAG_BLANK, blank_tag_size = 8;
-            uint32_t blank_start_ticks = total_ticks;
-            uint32_t blank_len_ticks = 9600;
-            merge_file.write((uint8_t*)&blank_tag_id, 2);
-            merge_file.write((uint8_t*)&blank_tag_size, 2);
-
-            uint8_t b_ts[8];
-            b_ts[0] = blank_start_ticks & 0xFF;
-            b_ts[1] = (blank_start_ticks >> 8) & 0xFF;
-            b_ts[2] = (blank_start_ticks >> 16) & 0xFF;
-            b_ts[3] = (blank_start_ticks >> 24) & 0xFF;
-            b_ts[4] = blank_len_ticks & 0xFF;
-            b_ts[5] = (blank_len_ticks >> 8) & 0xFF;
-            b_ts[6] = (blank_len_ticks >> 16) & 0xFF;
-            b_ts[7] = (blank_len_ticks >> 24) & 0xFF;
-            merge_file.write(b_ts, 8);
-            total_ticks += blank_len_ticks;
-
-            // --- 3. 追記ファイル（新規録音分）からタグをコピー ---
-            uint8_t skip_header[24];
-            new_part_file.read(skip_header, 24);
-
-            while (new_part_file.available()) {
-                uint16_t tag_id = 0, tag_size = 0;
-                if (new_part_file.read((uint8_t*)&tag_id, 2) != 2) {
-                    break;
-                }
-                if (new_part_file.read((uint8_t*)&tag_size, 2) != 2) {
-                    break;
-                }
-
-                // VERSIONタグは既存ファイルにあるためスキップ
-                if (tag_id == T88_TAG_VERSION) {
-                    uint32_t skip_rem = tag_size;
-                    while (skip_rem > 0) {
-                        new_part_file.read();
-                        skip_rem--;
-                    }
-                    continue;
-                }
-                if (tag_id == T88_TAG_END) {
-                    break;
-                }
-
-                merge_file.write((uint8_t*)&tag_id, 2);
-                merge_file.write((uint8_t*)&tag_size, 2);
-
-                uint32_t bytes_to_read = tag_size;
-                if (tag_id >= 0x0100 && tag_size >= 8) {
-                    uint8_t ts_buf[8];
-                    size_t read_bytes = new_part_file.read(ts_buf, 8);
-                    if (read_bytes == 8) {
-                        uint32_t current_tag_start =
-                            (uint32_t)ts_buf[0] | ((uint32_t)ts_buf[1] << 8) |
-                            ((uint32_t)ts_buf[2] << 16) |
-                            ((uint32_t)ts_buf[3] << 24);
-                        current_tag_start += total_ticks;
-                        ts_buf[0] = current_tag_start & 0xFF;
-                        ts_buf[1] = (current_tag_start >> 8) & 0xFF;
-                        ts_buf[2] = (current_tag_start >> 16) & 0xFF;
-                        ts_buf[3] = (current_tag_start >> 24) & 0xFF;
-                    }
-                    if (read_bytes > 0) {
-                        merge_file.write(ts_buf, read_bytes);
-                        bytes_to_read -= read_bytes;
-                    }
-                }
-
-                uint32_t remaining = bytes_to_read;
-                uint8_t buffer[256];
-                while (remaining > 0) {
-                    size_t to_read = (remaining > sizeof(buffer))
-                                         ? sizeof(buffer)
-                                         : remaining;
-                    int read_bytes = new_part_file.read(buffer, to_read);
-                    if (read_bytes <= 0) {
-                        break;
-                    }
-                    merge_file.write(buffer, read_bytes);
-                    remaining -= read_bytes;
-                }
-            }
-
-            // --- 4. 最後に終了タグを明示的に書き込む ---
-            uint16_t end_tag_id = T88_TAG_END;
-            uint16_t end_tag_size = 0;
-            merge_file.write((uint8_t*)&end_tag_id, 2);
-            merge_file.write((uint8_t*)&end_tag_size, 2);
-
-            success = true;
 
         } else {
             // CMT / CAS / P6 等の単純連結
@@ -489,7 +412,9 @@ static bool append_converted_raw_to_file(const char* target_path,
                 success = copy_file_contents(merge_file, new_part_file);
             }
         }
-        merge_file.flush();
+        if (merge_file) {  // P6T / T88 は閉じてある
+            merge_file.flush();
+        }
     }
 
     if (old_file) {
@@ -521,7 +446,7 @@ static bool append_converted_raw_to_file(const char* target_path,
     return success;
 }
 
-bool start_raw_recording(const char* filename) {
+bool start_raw_recording() {
     if (SD.exists(raw_rec_path)) {
         SD.remove(raw_rec_path);
     }
@@ -590,8 +515,12 @@ void stop_raw_recording_and_finalize() {
     bool success = false;
 
     if (selected_rec_mode == MODE_APPEND) {
-        success = append_converted_raw_to_file(target_filename, raw_rec_path,
-                                               default_rec_fmt);
+        // 追記するデータは、設定の Rec Fmt ではなく追記先と同じ形式で変換する
+        RecFormat append_fmt;
+        if (append_format_from_filename(target_filename, &append_fmt)) {
+            success = append_converted_raw_to_file(target_filename, raw_rec_path,
+                                                   append_fmt);
+        }
     } else {
         std::function<bool(const char*, const char*)> converter;
         switch (default_rec_fmt) {
@@ -607,6 +536,12 @@ void stop_raw_recording_and_finalize() {
             case FMT_P6:
                 converter = convert_raw_to_cmt;
                 break;
+            case FMT_T77:
+                converter = convert_raw_to_t77;
+                break;
+            case FMT_P6T:
+                converter = convert_raw_to_p6t;
+                break;
             default:
                 converter = nullptr;
                 break;
@@ -615,7 +550,10 @@ void stop_raw_recording_and_finalize() {
             success = converter(raw_rec_path, target_filename);
             if (success) {
                 // 新規作成の場合、変換後に抽出とリネームを実行
-                String extracted = extract_names_from_file(target_filename);
+                String extracted =
+                    (default_rec_fmt == FMT_T77)
+                        ? names_from_t77_headers()
+                        : extract_names_from_file(target_filename);
                 if (extracted.length() > 0) {
                     rename_target_filename_with_extracted_names(extracted);
                 }
@@ -644,7 +582,8 @@ void handle_raw_recording_stream() {
         uint32_t pulse_ticks = US_TO_PIO_TICKS(us);
 
         if (!rec_triggered) {
-            if (pulse_ticks >= 80 && pulse_ticks <= 1500) {
+            if (pulse_ticks >= REC_VALID_PULSE_MIN_TICKS &&
+                pulse_ticks <= REC_VALID_PULSE_MAX_TICKS) {
                 rec_valid_pulse_count++;
                 if (rec_valid_pulse_count >= 50) {
                     rec_triggered = true;

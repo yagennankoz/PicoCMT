@@ -4,11 +4,6 @@
 
 #include <functional>
 
-struct PulseLog {
-    bool is_high;
-    uint32_t pulse_us;
-};
-
 class FskDemodulator {
    public:
     enum BaudRate { BAUD_1200, BAUD_600 };
@@ -16,7 +11,9 @@ class FskDemodulator {
     bool baud_locked = false;
 
     // 遅延評価（バッファリング）用
-    PulseLog pulse_buffer[64];
+    // ボーレートが決まるまで半周期の長さ (us) をためておき、決まったらUART処理へ流し込む
+    static constexpr int BAUD_DETECT_PULSES = 128;
+    uint32_t pulse_buffer[BAUD_DETECT_PULSES];
     int pulse_buffer_count = 0;
     bool buffering_baud = false;
 
@@ -73,11 +70,28 @@ class FskDemodulator {
     }
 
     void advance_gap(uint32_t gap_us) {
+        finish();
         current_time_us += gap_us;
         reset();
     }
 
+    // 信号の区切り(無音・ファイル終端)で呼ぶ。ボーレート判定中の半周期があれば
+    // 手元の情報で判定してUART処理へ流し込む
+    void finish() {
+        if (buffering_baud && pulse_buffer_count > 0) {
+            lock_baud_and_flush(decide_baud_rate());
+        }
+    }
+
     void feed_pulse(bool is_high, uint32_t pulse_us) {
+        // 長いパルス(ドロップアウト等)は区切りとして扱う。時間は経過させる
+        if (pulse_us > 2000) {
+            finish();
+            current_time_us += pulse_us;
+            reset();
+            return;
+        }
+
         // 1. 半波合成と速度推定(Tape Speed Tracking)
         if (!has_pending_half) {
             pending_is_high = is_high;
@@ -86,11 +100,14 @@ class FskDemodulator {
         } else {
             if (pending_is_high != is_high) {
                 uint32_t full_us = pending_us + pulse_us;
-                bool is_space_full = (full_us >= 625);
+                // 同じ種類の半周期が2つ並んだ組だけで測る。Mark と Space が混ざった組
+                // (スタートビットの境目など) は1ビットの長さと関係がない
+                bool prev_space = (pending_us >= 312);
+                bool cur_space = (pulse_us >= 312);
 
                 // アイドル中のみ速度学習を行う (データ中のジッタ排除)
-                if (uart_state == 0) {
-                    uint32_t est_win = is_space_full ? full_us : (full_us * 2);
+                if (uart_state == 0 && prev_space == cur_space) {
+                    uint32_t est_win = cur_space ? full_us : (full_us * 2);
                     // 異常値排除 (833us の ±25%)
                     if (est_win > 625 && est_win < 1041) {
                         current_window_us =
@@ -105,11 +122,6 @@ class FskDemodulator {
         }
 
         bool is_space = (pulse_us >= 312);
-
-        if (pulse_us > 2000) {
-            reset();
-            return;
-        }
 
         // ノイズ対策: 有効なMarkキャリアが一定期間(16半波 =
         // 約3.3ms)連続して初めてデータ開始とみなす
@@ -130,69 +142,96 @@ class FskDemodulator {
                 buffering_baud = true;
             }
             if (buffering_baud) {
-                if (pulse_buffer_count < 64) {
-                    pulse_buffer[pulse_buffer_count].is_high = is_high;
-                    pulse_buffer[pulse_buffer_count].pulse_us = pulse_us;
-                    pulse_buffer_count++;
+                pulse_buffer[pulse_buffer_count++] = pulse_us;
+
+                // 最初のSpace(スタートビット)が1半波で終わった場合はノイズとみなして判定をやめる
+                if (pulse_buffer_count == 2 && !is_space) {
+                    abort_baud_detection();
+                    return;
                 }
-
-                int space_run = 0;
-                int mark_run = 0;
-                int state = 0;
-                for (int i = 0; i < pulse_buffer_count; i++) {
-                    bool p_is_space = (pulse_buffer[i].pulse_us >= 312);
-                    if (state == 0) {
-                        if (p_is_space) {
-                            space_run++;
-                        } else {
-                            state = 1;
-                            mark_run++;
-                        }
-                    } else if (state == 1) {
-                        if (!p_is_space) {
-                            mark_run++;
-                        } else {
-                            state = 2;
-                            break;
-                        }
-                    }
+                if (has_1200_only_run()) {
+                    lock_baud_and_flush(BAUD_1200);
+                } else if (pulse_buffer_count >= BAUD_DETECT_PULSES) {
+                    lock_baud_and_flush(decide_baud_rate());
                 }
-
-                // 最初のSpace区間とMark区間が両方揃った、またはバッファが一杯になったら判定
-                if (state == 2 || pulse_buffer_count >= 64) {
-                    if (space_run % 4 == 2 || mark_run % 8 == 4) {
-                        // 1200ボーにしか出現し得ない半波長
-                        baud_rate = BAUD_1200;
-                    } else if (space_run > 18) {
-                        // 1200ボーの最大連続Space長（Start+8bit分=18）を超えるため600ボー確定
-                        baud_rate = BAUD_600;
-                    } else if (space_run == 4 && mark_run >= 12) {
-                        // 600ボーの典型的な 0xD3 ヘッダのパターン
-                        baud_rate = BAUD_600;
-                    } else {
-                        // 曖昧な場合は標準の1200ボーを優先
-                        baud_rate = BAUD_1200;
-                    }
-
-                    baud_locked = true;
-                    buffering_baud = false;
-
-                    // バッファされたパルスをUART処理へ流し込む
-                    for (int i = 0; i < pulse_buffer_count; i++) {
-                        process_uart(pulse_buffer[i].is_high,
-                                     pulse_buffer[i].pulse_us);
-                    }
-                    pulse_buffer_count = 0;
-                }
-                return;  // バッファリング中はここで処理を打ち切る
+                return;  // ためた半周期は流し込み済み、またはバッファリング中
             }
         }
 
         // 判定済み、またはデータ外のパルスはそのままUARTへ
-        process_uart(is_high, pulse_us);
+        process_uart(pulse_us);
     }
 
-    void process_uart(bool is_high, uint32_t pulse_us) {
+   private:
+    // 1ビットの半周期数は 1200ボー: Space 2 / Mark 4、600ボー: Space 4 / Mark 8。
+    // 600ボーの連続数は Space が4の倍数、Mark が8の倍数にしかならないので、
+    // それ以外 (Space 4n+2 / Mark 8n+4) は1200ボーにしか出ない。
+    // リーダーやアイドルの長いMarkは判断材料にしない
+    static bool is_1200_only_run(bool space, int n) {
+        if (space) {
+            return n <= 18 && (n % 4) == 2;
+        }
+        return n <= 40 && (n % 8) == 4;
+    }
+
+    // ためた半周期の中で、区切りが確定した連続 (次の切り替わりまで見えたもの) を調べる
+    bool has_1200_only_run() const {
+        int run = 0;
+        bool run_space = false;
+        for (int i = 0; i < pulse_buffer_count; i++) {
+            bool s = (pulse_buffer[i] >= 312);
+            if (run > 0 && s != run_space) {
+                if (is_1200_only_run(run_space, run)) {
+                    return true;
+                }
+                run = 0;
+            }
+            run_space = s;
+            run++;
+        }
+        return false;
+    }
+
+    // 区切りが確定した連続の数
+    int completed_runs() const {
+        int runs = 0;
+        for (int i = 1; i < pulse_buffer_count; i++) {
+            if ((pulse_buffer[i] >= 312) != (pulse_buffer[i - 1] >= 312)) {
+                runs++;
+            }
+        }
+        return runs;
+    }
+
+    // 1200ボーの証拠が見つからないまま判定する場合: 十分な数の連続を見ていれば600ボー。
+    // 判断材料が少ない場合は標準の1200ボーを優先する
+    BaudRate decide_baud_rate() const {
+        if (has_1200_only_run()) {
+            return BAUD_1200;
+        }
+        return (completed_runs() >= 4) ? BAUD_600 : BAUD_1200;
+    }
+
+    void lock_baud_and_flush(BaudRate rate) {
+        baud_rate = rate;
+        baud_locked = true;
+        flush_pulse_buffer();
+    }
+
+    void abort_baud_detection() { flush_pulse_buffer(); }
+
+    // バッファされたパルスをUART処理へ流し込む
+    void flush_pulse_buffer() {
+        buffering_baud = false;
+        int count = pulse_buffer_count;
+        pulse_buffer_count = 0;
+        for (int i = 0; i < count; i++) {
+            process_uart(pulse_buffer[i]);
+        }
+    }
+
+   public:
+    void process_uart(uint32_t pulse_us) {
         last_edge_time_us = current_time_us;
         current_time_us += pulse_us;
         bool is_space = (pulse_us >= 312);

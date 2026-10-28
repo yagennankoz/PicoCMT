@@ -14,7 +14,7 @@ typedef enum {
     STATE_PLAYING,
     STATE_WIFI_MENU,
     STATE_WIFI_CONFIG,
-    STATE_WIFI_PIN_CONNECT,
+    STATE_WEB_PASS_CONFIG,
     STATE_WIFI_SAVE_RESULT,
     STATE_WIFI_CONNECT_ERROR
 } SystemState;
@@ -37,7 +37,8 @@ typedef enum {
     FMT_CMT,
     FMT_CAS,
     FMT_P6,
-    //    FMT_T77,
+    FMT_T77,
+    FMT_P6T,  // 設定 (EEPROM) に番号で保存するので、追加は最後にする
     FMT_MAX
 } RecFormat;
 
@@ -77,9 +78,7 @@ typedef struct {
     bool core1_play_session_initialized;
     uint32_t core1_play_swap_count;
     uint16_t core1_play_last_t88_data;
-    bool core1_play_using_buffer_a;
     bool core1_pio_enabled;
-    bool core1_dma_busy;
     uint8_t core1_gpio_level;
     char playback_log[24];
 } PlaybackStatus;

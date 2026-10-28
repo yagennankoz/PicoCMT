@@ -10,6 +10,7 @@
 #include "cmt_core1.h"
 #include "cmt_globals.h"
 #include "cmt_hw_config.h"
+#include "cmt_clock.h"
 #include "cmt_network.h"
 #include "cmt_pins.h"
 #include "cmt_storage.h"
@@ -46,7 +47,6 @@ String current_path = "/";
 
 queue_t cmt_data_queue;
 queue_t cmt_play_queue;
-int buffer_idx = 0;
 
 File cmt_file;
 int rec_menu_cursor = 0;
@@ -70,41 +70,6 @@ static uint32_t stop_button_hold_start_ms = 0;
 
 int cmt_selected_baud_rate = 1200;
 int cas_selected_baud_rate = 1200;
-
-static bool is_sd_inserted() {
-    static uint32_t last_probe_ms = 0;
-    static bool last_probe_result = false;
-    uint32_t now = millis();
-
-    if (now - last_probe_ms < 1000) {
-        return last_probe_result;
-    }
-    last_probe_ms = now;
-
-    if (sd_card_mounted) {
-        File root = SD.open("/");
-        if (root) {
-            root.close();
-            last_probe_result = true;
-            return true;
-        }
-        last_probe_result = false;
-        return false;
-    } else {
-        if (gpio_get(PICO_SPI_DETECT_PIN) == 0) {
-            last_probe_result = true;
-            return true;
-        }
-        SD.end();
-        if (SD.begin(PICO_SD_CS_PIN, SD_SCK_MHZ(24), SPI1)) {
-            SD.end();
-            last_probe_result = true;
-            return true;
-        }
-        last_probe_result = false;
-        return false;
-    }
-}
 
 static bool mount_sd_card() {
     SD.end();
@@ -280,7 +245,7 @@ void setup() {
     gpio_pull_up(PICO_SPI_DETECT_PIN);
 
     init_cores_communication();
-    watchdog_enable(4000, 0);
+    watchdog_enable(SYSTEM_WATCHDOG_TIMEOUT_MS, 0);
 
     Wire1.setSDA(PICO_I2C_SDA_PIN);
     Wire1.setSCL(PICO_I2C_SCL_PIN);
@@ -293,6 +258,7 @@ void setup() {
     }
 
     init_wifi_and_settings();
+    clock_init();
 
     SPI1.setRX(PICO_SPI_MISO_PIN);
     SPI1.setTX(PICO_SPI_MOSI_PIN);
@@ -385,12 +351,12 @@ void loop() {
         case STATE_WIFI_CONFIG:
             handle_wifi_config_input();
             break;
-        case STATE_WIFI_PIN_CONNECT:
-            handle_wifi_pin_connect_input();
+        case STATE_WEB_PASS_CONFIG:
+            handle_web_pass_config_input();
             break;
         case STATE_WIFI_SAVE_RESULT:
             if ((int32_t)(now_ms - wifi_save_result_until_ms) >= 0) {
-                wifi_menu_cursor = wifi_settings_saved ? 0 : 1;
+                wifi_menu_cursor = settings_save_return_cursor;
                 current_state = STATE_WIFI_MENU;
                 reset_and_ignore_pressed_buttons();
                 oled_need_refresh = true;

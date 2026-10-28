@@ -19,7 +19,6 @@ static uint pio_play_program_offset = 0;
 
 // 録音側ステート管理
 static bool rec_pio_running = false;
-static constexpr uint32_t CYCLES_PER_PIO_LOOP = 2;
 static bool rec_buzzer_enabled = false;
 
 // ============================================================================
@@ -87,6 +86,24 @@ static void start_cmt_play_pio() {
     play_pio_running = true;
 }
 
+// キューから1つ取り出してPIOへ送る。キューが空なら前回値を2つ送る
+// (PIOは値ごとにH/Lを反転するので、繰り返しを偶数回にして極性を保つ)
+// FIFOに2つ分の空きがなく送れなかった場合は false
+static bool feed_play_fifo(PIO pio) {
+    uint16_t t88_data;
+    if (queue_try_remove(&cmt_play_queue, &t88_data)) {
+        play_last_t88_data = t88_data;
+        pio_sm_put(pio, pio_play_sm, (uint32_t)t88_data);
+        return true;
+    }
+    if (pio_sm_get_tx_fifo_level(pio, pio_play_sm) > 2) {
+        return false;
+    }
+    pio_sm_put(pio, pio_play_sm, (uint32_t)play_last_t88_data);
+    pio_sm_put(pio, pio_play_sm, (uint32_t)play_last_t88_data);
+    return true;
+}
+
 void request_playback_shutdown() {
     play_shutdown_requested = true;
 
@@ -128,11 +145,9 @@ void init_core1_playback_prime() {
 
     // FIFOを事前にある程度満たしておく
     while (!pio_sm_is_tx_fifo_full(pio, pio_play_sm)) {
-        uint16_t t88_data;
-        if (queue_try_remove(&cmt_play_queue, &t88_data)) {
-            play_last_t88_data = t88_data;
+        if (!feed_play_fifo(pio)) {
+            break;
         }
-        pio_sm_put(pio, pio_play_sm, (uint32_t)play_last_t88_data);
     }
 
     play_session_initialized = true;
@@ -155,11 +170,9 @@ static void core1_play_loop() {
 
     if (!play_session_initialized) {
         while (!pio_sm_is_tx_fifo_full(pio0, pio_play_sm)) {
-            uint16_t t88_data;
-            if (queue_try_remove(&cmt_play_queue, &t88_data)) {
-                play_last_t88_data = t88_data;
+            if (!feed_play_fifo(pio0)) {
+                break;
             }
-            pio_sm_put(pio0, pio_play_sm, (uint32_t)play_last_t88_data);
         }
         play_session_initialized = true;
         play_swap_count = 0;
@@ -174,18 +187,17 @@ static void core1_play_loop() {
 
     // TX FIFOに空きがある限り、キューから取り出してPIOへ供給
     while (!pio_sm_is_tx_fifo_full(pio0, pio_play_sm)) {
-        uint16_t t88_data;
-        // キューが間に合わない(空)場合は、前回のパルス幅を維持(波形崩れ防止)
-        if (queue_try_remove(&cmt_play_queue, &t88_data)) {
-            play_last_t88_data = t88_data;
+        // キューが間に合わない(空)場合は、前回のパルス幅を2つずつ繰り返す
+        // (T88/CASの無音区間もこの繰り返しで出力している)
+        if (!feed_play_fifo(pio0)) {
+            break;
         }
-        pio_sm_put(pio0, pio_play_sm, (uint32_t)play_last_t88_data);
         play_swap_count++;
     }
 }
 
 // ============================================================================
-// 録音(REC) 系関数群 (完全DMAフリー版)
+// 録音(REC) 系関数群
 // ============================================================================
 
 static void init_cmt_rec_pio() {
@@ -288,17 +300,8 @@ static void core1_rec_loop() {
 // Core0 から呼ばれるステータス取得関数
 // ============================================================================
 
-void get_core1_playback_stats(bool* session_initialized, uint32_t* swap_count) {
-    if (session_initialized != NULL) {
-        *session_initialized = play_session_initialized;
-    }
-    if (swap_count != NULL) {
-        *swap_count = play_swap_count;
-    }
-}
-
 void get_core1_playback_stats(bool* session_initialized, uint32_t* swap_count,
-                              uint16_t* last_t88_data, bool* using_buffer_a) {
+                              uint16_t* last_t88_data) {
     if (session_initialized != NULL) {
         *session_initialized = play_session_initialized;
     }
@@ -308,19 +311,11 @@ void get_core1_playback_stats(bool* session_initialized, uint32_t* swap_count,
     if (last_t88_data != NULL) {
         *last_t88_data = play_last_t88_data;
     }
-    if (using_buffer_a != NULL) {
-        *using_buffer_a = true;  // DMA廃止につき常にtrue互換
-    }
 }
 
-void get_core1_playback_io_stats(bool* pio_enabled, bool* dma_busy,
-                                 uint8_t* gpio_level) {
+void get_core1_playback_io_stats(bool* pio_enabled, uint8_t* gpio_level) {
     if (pio_enabled != NULL) {
         *pio_enabled = play_session_initialized;
-    }
-    // DMA廃止につき、TX FIFOが一杯でない（まだ送れる）状態をbusyとして返す
-    if (dma_busy != NULL) {
-        *dma_busy = !pio_sm_is_tx_fifo_empty(pio0, pio_play_sm);
     }
     if (gpio_level != NULL) {
         uint32_t current_outputs = sio_hw->gpio_out;

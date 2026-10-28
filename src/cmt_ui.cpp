@@ -8,6 +8,7 @@
 #include "cmt_network_config.h"
 #include "cmt_pins.h"
 #include "cmt_storage.h"
+#include "cmt_storage_record.h"
 #include "cmt_types.h"
 #include "hardware/watchdog.h"
 
@@ -79,9 +80,6 @@ static void draw_cassette_animation(int x, int y, bool is_playing) {
         }
     }
 
-    int cas_w = 46;
-    int cas_h = 24;
-
     oled.drawLine(x + 10, y + 19, x + 34, y + 19, SSD1306_WHITE);
 
     // リール部分のビットマップ描画 (16x16)
@@ -89,17 +87,6 @@ static void draw_cassette_animation(int x, int y, bool is_playing) {
                     SSD1306_WHITE);
     oled.drawBitmap(x + 26, y + 4, reel_bmps[current_frame2], 16, 16,
                     SSD1306_WHITE);
-}
-
-static void draw_menu_footer(const char* left_label, const char* right_label) {
-    oled.setTextSize(1);
-    oled.setTextColor(SSD1306_WHITE);
-    oled.drawLine(0, 54, 127, 54, SSD1306_WHITE);
-    oled.setCursor(0, 56);
-    oled.print("L:");
-    oled.print(left_label);
-    oled.print("  R:");
-    oled.println(right_label);
 }
 
 void draw_marquee_text(int x, int y, int max_chars, const char* text,
@@ -266,6 +253,23 @@ static void render_playback_screen_to_oled() {
     oled.display();
 }
 
+// Webファイルマネージャを開くURL ("http://picocmt.local/" は21文字で、画面の幅ちょうど)
+#define WEB_URL_TEXT "http://" WEB_MDNS_HOSTNAME ".local/"
+#define OLED_TEXT_COLUMNS 21
+
+// IPアドレスのURL。画面に入りきらない長さのアドレスは "IP:" の形で表示する
+static void print_ip_url() {
+    String ip = WiFi.localIP().toString();
+    if (7 + ip.length() + 1 <= OLED_TEXT_COLUMNS) {
+        oled.print("http://");
+        oled.print(ip);
+        oled.print("/");
+    } else {
+        oled.print("IP:");
+        oled.print(ip);
+    }
+}
+
 void render_wifi_menu_to_oled() {
     oled.clearDisplay();
     oled.setTextSize(1);
@@ -284,13 +288,21 @@ void render_wifi_menu_to_oled() {
     oled.print(wifi_menu_cursor == 0 ? ">" : " ");
     oled.print(" WiFi: ");
     if (wifi_settings_saved) {
-        if (wifi_opt_sel == 0) {
-            oled.println("CLEAR");
-        } else if (wifi_opt_sel == 1) {
-            oled.println("OFF");
-        } else if (wifi_opt_sel == 2) {
-            oled.println("ON");
+        static const char* const opt_names[] = {"CLEAR", "OFF", "ON"};
+        // 今の状態と違う値を選んでいる (まだ OK を押していない) ときは、
+        // 値を点滅させて "OK?" を付ける。CLEAR は選んだ時点で未確定
+        int current_opt = wifi_user_enabled ? 2 : 1;
+        bool pending = (wifi_opt_sel != current_opt);
+        int opt = (wifi_opt_sel >= 0 && wifi_opt_sel <= 2) ? wifi_opt_sel : current_opt;
+        if (!pending || wifi_ui_blink_on) {
+            oled.print(opt_names[opt]);
+        } else {
+            oled.print(opt == 0 ? "     " : (opt == 1 ? "   " : "  "));
         }
+        if (pending) {
+            oled.print(" OK?");
+        }
+        oled.println();
     } else {
         oled.println("DISABLED");
     }
@@ -303,32 +315,45 @@ void render_wifi_menu_to_oled() {
     int y2 = 30;
     oled.setCursor(0, y2);
     oled.print(wifi_menu_cursor == 2 ? ">" : " ");
-    oled.print(" Rec Fmt: ");
-    const char* fmt_names[] = {"T88", "CMT", "CAS", "P6"};
+    oled.print(" Web Pass: ");
+    oled.println(web_auth_enabled ? "ON" : "OFF");
 
-    // 安全装置: 万が一未定義のフォーマットが設定されていた場合はT88に戻す
-    if (default_rec_fmt >= 3) {
+    int y3 = 40;
+    oled.setCursor(0, y3);
+    oled.print(wifi_menu_cursor == 3 ? ">" : " ");
+    oled.print(" Rec Fmt: ");
+    const char* fmt_names[] = {"T88", "CMT", "CAS", "P6", "T77", "P6T"};
+    static_assert(sizeof(fmt_names) / sizeof(fmt_names[0]) == FMT_MAX, "fmt_names");
+
+    if (default_rec_fmt >= FMT_MAX) {
         default_rec_fmt = FMT_T88;
     }
     oled.println(fmt_names[default_rec_fmt]);
 
-    oled.setCursor(0, 44);
-    oled.print("IP: ");
+    oled.setCursor(0, 54);
     if (wifi_connect_in_progress) {
         if (wifi_ui_blink_on) {
-            oled.print("Connecting..");
+            oled.print("IP: Connecting..");
         }
-    } else if (wifi_connected) {
-        oled.print(WiFi.localIP());
+    } else if (!wifi_connected) {
+        oled.print("IP: Disconnected");
     } else {
-        oled.print("Disconnected");
+        // 接続中は、ブラウザで開くURL・IPアドレス・ログイン情報 (認証 ON のとき) を順に表示する
+        switch ((millis() / 2500) % (web_auth_enabled ? 3 : 2)) {
+            case 0:
+                oled.print(WEB_URL_TEXT);
+                break;
+            case 1:
+                print_ip_url();
+                break;
+            default:
+                oled.print("ID:");
+                oled.print(WEB_USERNAME);
+                oled.print(" PW:");
+                oled.print(web_password);
+                break;
+        }
     }
-
-    oled.setCursor(0, 54);
-    oled.print("ID:");
-    oled.print(FTP_USERNAME);
-    oled.print(" PW:");
-    oled.print(FTP_PASSWORD);
 
     oled.display();
 }
@@ -406,14 +431,7 @@ void render_rec_menu_to_oled() {
     oled.print("File: ");
     draw_marquee_text(36, 12, 15, target_filename, true);
 
-    const char* ext = strrchr(target_filename, '.');
-    bool is_appendable = false;
-    if (ext) {
-        if (strcasecmp(ext, ".T88") == 0 || strcasecmp(ext, ".T77") == 0 ||
-            strcasecmp(ext, ".CAS") == 0) {
-            is_appendable = true;
-        }
-    }
+    bool is_appendable = is_appendable_filename(target_filename);
 
     const char* menu_items[] = {" Create New File", " Append to File"};
     int menu_count = is_appendable ? 2 : 1;
@@ -461,7 +479,6 @@ void render_file_browser_to_oled() {
         return;
     }
 
-    // 4行表示
     for (int i = 0; i < 4; i++) {
         int item_idx = scroll_offset + i;
         if (item_idx >= total_items) {
@@ -483,7 +500,6 @@ void render_file_browser_to_oled() {
         draw_marquee_text(24, y_pos, 17, item.name, item_idx == current_cursor);
     }
 
-    // CMT/P6/CASファイル選択時のボーレート選択領域描画
     if (total_items > 0 && !file_list[current_cursor].is_dir) {
         const char* ext = strrchr(file_list[current_cursor].name, '.');
         bool is_cmt = (ext && strcasecmp(ext, ".CMT") == 0);
@@ -581,8 +597,6 @@ void render_wifi_config_to_oled() {
             } else {
                 ch = '*';
             }
-        } else if (wifi_settings_saved && wifi_config_field != 1 && idx < 4) {
-            ch = '*';
         }
         if (wifi_config_field == 1 && idx == wifi_config_pos &&
             !wifi_ui_blink_on) {
@@ -591,62 +605,52 @@ void render_wifi_config_to_oled() {
         oled.print(ch);
     }
 
-    oled.setCursor(0, 36);
-    oled.print("PIN :");
-    for (int i = 0; i < 4; i++) {
-        bool has_digit = (wifi_pin[i] >= '0' && wifi_pin[i] <= '9');
-        char ch = '_';
-        if (wifi_config_field == 2) {
-            ch = has_digit ? wifi_pin[i] : '_';
-        } else if (has_digit || (wifi_settings_saved && i < 4)) {
-            ch = '*';
-        }
-        if (wifi_config_field == 2 && i == wifi_config_pos &&
-            !wifi_ui_blink_on) {
-            ch = ' ';
-        }
-        oled.print(ch);
-        if (i < 3) {
-            oled.print(' ');
-        }
-    }
+    oled.setCursor(0, 40);
+    oled.print(wifi_config_field == 0 ? "OK:Select STOP:Back" : "OK:Save STOP:Cancel");
 
     oled.setCursor(0, 56);
     if (wifi_connected) {
-        oled.print("IP:");
-        oled.print(WiFi.localIP());
+        oled.print(WEB_URL_TEXT);
     }
 
     oled.display();
 }
 
-void render_wifi_pin_to_oled() {
+void render_web_pass_config_to_oled() {
     oled.clearDisplay();
     oled.setTextSize(1);
     oled.setTextColor(SSD1306_WHITE);
 
     oled.setCursor(0, 0);
-    oled.println("-- WIFI PIN --");
+    oled.println("-- WEB PASSWORD --");
     oled.setCursor(0, 12);
-    oled.println("Enter PIN to connect");
+    oled.print("ID  :");
+    oled.print(WEB_USERNAME);
 
-    oled.setTextSize(2);
-    oled.setCursor(16, 28);
-    for (int i = 0; i < 4; i++) {
-        char ch =
-            (wifi_pin[i] >= '0' && wifi_pin[i] <= '9') ? wifi_pin[i] : '_';
-        if (i == wifi_config_pos && !wifi_ui_blink_on) {
+    const int pass_visible_chars = 12;
+    int pass_window_start = 0;
+    if (wifi_config_pos >= pass_visible_chars) {
+        pass_window_start = wifi_config_pos - pass_visible_chars + 1;
+    }
+
+    oled.setCursor(0, 24);
+    oled.print("PASS:");
+    for (int i = 0; i < pass_visible_chars; i++) {
+        int idx = pass_window_start + i;
+        char ch = '_';
+        if (idx < WEB_PASSWORD_MAX_LEN && web_password_edit[idx] != '\0') {
+            ch = web_password_edit[idx];
+        }
+        if (idx == wifi_config_pos && !wifi_ui_blink_on) {
             ch = ' ';
         }
         oled.print(ch);
-        if (i < 3) {
-            oled.print(" ");
-        }
     }
 
-    oled.setTextSize(1);
-    int cursor_x = 16 + (wifi_config_pos * 24);
-    oled.drawLine(cursor_x, 49, cursor_x + 10, 49, SSD1306_WHITE);
+    oled.setCursor(0, 40);
+    oled.print("OK:Save STOP:Cancel");
+    oled.setCursor(0, 52);
+    oled.print("All blank: " WEB_DEFAULT_PASSWORD);
 
     oled.display();
 }
@@ -663,7 +667,7 @@ void render_wifi_connect_error_to_oled() {
     oled.setCursor(0, 28);
     oled.println("Check SSID/PASS");
     oled.setCursor(0, 40);
-    oled.println("or PIN and retry");
+    oled.println("and retry");
     oled.setCursor(0, 56);
     oled.println("Press OK to return");
 
@@ -699,20 +703,18 @@ void update_oled_display() {
         render_wifi_menu_to_oled();
     } else if (current_state == STATE_WIFI_CONFIG) {
         render_wifi_config_to_oled();
-    } else if (current_state == STATE_WIFI_PIN_CONNECT) {
-        render_wifi_pin_to_oled();
+    } else if (current_state == STATE_WEB_PASS_CONFIG) {
+        render_web_pass_config_to_oled();
     } else if (current_state == STATE_WIFI_SAVE_RESULT) {
         oled.clearDisplay();
         oled.setTextSize(1);
         oled.setTextColor(SSD1306_WHITE);
-        oled.setCursor(0, 20);
-        if (wifi_save_result_success) {
-            oled.println("WiFi settings saved");
-        } else {
-            oled.println("WiFi save failed");
-        }
-        oled.setCursor(0, 36);
-        oled.println("Returning to menu...");
+        oled.setCursor(0, 16);
+        oled.print(settings_save_result_label);
+        oled.setCursor(0, 26);
+        oled.print(wifi_save_result_success ? "Saved" : "Save failed");
+        oled.setCursor(0, 44);
+        oled.print("Returning to menu...");
         oled.display();
     } else if (current_state == STATE_PLAY_STANDBY ||
                current_state == STATE_PLAYING) {

@@ -13,22 +13,16 @@
 // 基準周波数および Ticks 自動計算マクロ定義
 // ============================================================================
 
-#ifndef PIO_CLOCK_FREQ_HZ
-#define PIO_CLOCK_FREQ_HZ 1000000UL
-#endif
-
-#ifndef T88_CLOCK_FREQ_HZ
-#define T88_CLOCK_FREQ_HZ 4800UL
-#endif
-
 #define US_TO_PIO_TICKS(us) (us)
-#define MS_TO_PIO_TICKS(ms) ((ms) * 1000UL)
 
 inline uint32_t pio_ticks_to_us(uint32_t pio_ticks) { return pio_ticks; }
 
-inline uint32_t pio_ticks_to_t88_ticks(uint32_t pio_ticks) {
-    return (uint32_t)(((uint64_t)pio_ticks * T88_CLOCK_FREQ_HZ + 500000ULL) /
-                      1000000ULL);
+// 録音PIO(cmt_rec.pio)が計測値に含めない時間 (High 1.5us / Low 2.0us) の補正値
+#define REC_PIO_OVERHEAD_US 2
+
+// RAWのパルスワードから実際のパルス幅(us)を求める
+inline uint32_t raw_pulse_us(uint16_t raw_word) {
+    return pio_ticks_to_us((uint32_t)(raw_word & 0x7FFF)) + REC_PIO_OVERHEAD_US;
 }
 
 // --- 録音時の判定閾値 (マイクロ秒単位) ---
@@ -89,7 +83,6 @@ extern volatile bool playback_time_valid;
 extern queue_t cmt_data_queue;
 extern queue_t cmt_play_queue;
 
-extern int buffer_idx;
 
 extern int pio_rec_sm;
 extern int pio_play_sm;
@@ -98,7 +91,6 @@ extern bool oled_need_refresh;
 extern bool sd_card_inserted;
 extern bool sd_card_mounted;
 extern bool wifi_connected;
-extern bool ftp_server_running;
 extern bool wifi_connect_failed;
 extern bool wifi_connect_in_progress;
 extern uint32_t wifi_connect_started_ms;
@@ -106,19 +98,20 @@ extern bool wifi_settings_saved;
 extern bool wifi_user_enabled;
 extern bool wifi_ui_blink_on;
 extern bool wifi_save_result_success;
-extern bool wifi_settings_pin_requested;
 extern uint32_t wifi_save_result_until_ms;
 
 extern char wifi_ssid[33];
 extern char wifi_password[65];
-extern char wifi_pin[5];
-extern uint8_t wifi_session_key[32];
-extern bool wifi_session_key_valid;
+extern char web_password[];
+extern bool web_auth_enabled;
+extern char web_password_edit[];
+extern const char* settings_save_result_label;
+extern int settings_save_return_cursor;
 extern int wifi_config_field;
 extern int wifi_config_pos;
 extern int wifi_menu_cursor;
 extern bool wifi_config_apply_requested;
-extern bool wifi_connect_with_pin_requested;
+extern bool wifi_connect_requested;
 extern bool wifi_disconnect_requested;
 extern char wifi_scan_ssids[][33];
 extern int32_t wifi_scan_rssi[];
@@ -126,7 +119,6 @@ extern int wifi_scan_count;
 extern int wifi_scan_cursor;
 extern bool wifi_scan_requested;
 extern bool wifi_scan_in_progress;
-extern int wifi_pin_failed_attempts;
 
 extern volatile uint32_t rec_last_sound_time_ms;
 extern volatile uint32_t rec_start_time_ms;

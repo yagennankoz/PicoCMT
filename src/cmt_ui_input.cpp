@@ -10,27 +10,31 @@
 #include "cmt_network.h"
 #include "cmt_network_config.h"
 #include "cmt_pins.h"
+#include "cmt_storage_record.h"
 #include "cmt_types.h"
 #include "cmt_ui.h"
 #include "pico/util/queue.h"
 
 extern bool start_playback_file(const char* filename);
 extern bool jump_playback_to_blank(int direction);
-extern bool start_raw_recording(const char* filename);
+extern bool start_raw_recording();
 extern void stop_playback_and_return_idle();
 extern void update_system_run_permissions();
 extern bool load_directory(const String& path);
-extern void refresh_wifi_session_key_from_pin();
 extern bool load_wifi_settings_from_flash();
 extern void complete_playback_and_stay_on_screen();
 
+// パスワードに使える文字 (WPA のパスフレーズに使える印字可能な ASCII 0x20-0x7E すべて)
 static const char WIFI_CHARSET[] =
-    " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.@/";
+    " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+static_assert(sizeof(WIFI_CHARSET) - 1 == 0x7E - 0x20 + 1, "WIFI_CHARSET must cover 0x20-0x7E");
 
 static uint32_t wifi_edit_last_repeat_ms[NUM_BUTTONS] = {0};
 static bool wifi_menu_wait_stop_release = false;
-static bool wifi_pin_save_confirm_pending = false;
-static bool wifi_pin_connect_confirm_pending = false;
+
+// Webパスワード入力画面で編集中のパスワード
+char web_password_edit[WEB_PASSWORD_MAX_LEN + 1] = {0};
 
 static void build_selected_item_abs_path(char* out, size_t out_size,
                                          const char* item_name) {
@@ -114,26 +118,50 @@ static char rotate_wifi_char(char current, int step) {
     return WIFI_CHARSET[idx];
 }
 
-static char rotate_pin_digit(char current, int step) {
-    int d = current - '0';
-    if (d < 0 || d > 9) {
-        d = 0;
+// 文字列の編集 (UP/DOWN: 文字を変える, LEFT/RIGHT: 桁を移動)。
+// 途中に空き ('\0') ができると以降が切れてしまうので、文字のない位置より先へは進めない。
+// LEFT で先頭より前に出ようとしたら true
+static bool edit_text_buffer(char* buf, int max_len) {
+    if (wifi_config_pos < 0) {
+        wifi_config_pos = 0;
     }
-    d += step;
-    if (d < 0) {
-        d = 9;
+    if (wifi_config_pos >= max_len) {
+        wifi_config_pos = max_len - 1;
     }
-    if (d > 9) {
-        d = 0;
+
+    if (consume_wifi_edit_button(IDX_UP)) {
+        buf[wifi_config_pos] = rotate_wifi_char(buf[wifi_config_pos], +1);
+        oled_need_refresh = true;
     }
-    return (char)('0' + d);
+    if (consume_wifi_edit_button(IDX_DOWN)) {
+        buf[wifi_config_pos] = rotate_wifi_char(buf[wifi_config_pos], -1);
+        oled_need_refresh = true;
+    }
+    if (btn_trigger_clicked[IDX_RIGHT]) {
+        btn_trigger_clicked[IDX_RIGHT] = false;
+        if (wifi_config_pos < (max_len - 1) && buf[wifi_config_pos] != '\0') {
+            wifi_config_pos++;
+        }
+        oled_need_refresh = true;
+    }
+    if (btn_trigger_clicked[IDX_LEFT]) {
+        btn_trigger_clicked[IDX_LEFT] = false;
+        oled_need_refresh = true;
+        if (wifi_config_pos > 0) {
+            wifi_config_pos--;
+        } else {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void build_default_record_filename() {
     char candidate[sizeof(target_filename)] = {0};
-    const char* ext_list[] = {".T88", ".CMT", ".CAS", ".P6"};
+    const char* ext_list[] = {".T88", ".CMT", ".CAS", ".P6", ".T77", ".P6T"};
+    static_assert(sizeof(ext_list) / sizeof(ext_list[0]) == FMT_MAX, "ext_list");
 
-    if (default_rec_fmt >= 4) {
+    if (default_rec_fmt >= FMT_MAX) {
         default_rec_fmt = FMT_T88;
     }
     const char* ext = ext_list[default_rec_fmt];
@@ -308,20 +336,11 @@ void handle_file_browser_input() {
 
         // ファイルが選択されている場合のみ、追記メニューを表示するか判断する
         if (total_items > 0 && !file_list[current_cursor].is_dir) {
-            const char* ext = strrchr(file_list[current_cursor].name, '.');
-            if (ext) {
-                // 追記対応フォーマットなら、メニュー表示フラグを立てる
-                if (strcasecmp(ext, ".T88") == 0 ||
-                    strcasecmp(ext, ".T77") == 0 ||
-                    strcasecmp(ext, ".P6") == 0 ||
-                    strcasecmp(ext, ".CAS") == 0) {
-                    should_show_rec_menu = true;
-                }
-            }
+            should_show_rec_menu = is_appendable_filename(file_list[current_cursor].name);
         }
 
         if (should_show_rec_menu) {
-            // 追記可能なファイルなので、録音メニューを表示 ---
+            // 追記可能なファイルなので、録音メニューを表示
             build_selected_item_abs_path(target_filename,
                                          sizeof(target_filename),
                                          file_list[current_cursor].name);
@@ -329,10 +348,10 @@ void handle_file_browser_input() {
             current_state = STATE_REC_MENU;
             oled_need_refresh = true;
         } else {
-            // 新規録音しかできないので、メニューをスキップして即開始 ---
+            // 新規録音しかできないので、メニューをスキップして即開始
             build_default_record_filename();
             selected_rec_mode = MODE_NEW;
-            if (start_raw_recording(raw_rec_path)) {
+            if (start_raw_recording()) {
                 current_state = STATE_REC_STANDBY;
                 rec_paused = true;
                 manual_ok_override = false;
@@ -385,7 +404,7 @@ void handle_rec_menu_input() {
             build_default_record_filename();
         }
 
-        if (start_raw_recording(raw_rec_path)) {
+        if (start_raw_recording()) {
             current_state = STATE_REC_STANDBY;
             rec_paused = true;
             manual_ok_override = false;
@@ -409,7 +428,7 @@ void handle_wifi_menu_input() {
     }
 
     int min_cursor = wifi_settings_saved ? 0 : 1;
-    int max_cursor = 2;
+    int max_cursor = 3;
 
     if (wifi_menu_cursor < min_cursor) {
         wifi_menu_cursor = min_cursor;
@@ -461,13 +480,26 @@ void handle_wifi_menu_input() {
             oled_need_refresh = true;
         }
     } else if (wifi_menu_cursor == 2) {
+        // Web の認証の ON/OFF (その場で保存する)
+        if (btn_trigger_clicked[IDX_LEFT] || btn_trigger_clicked[IDX_RIGHT]) {
+            bool enable = btn_trigger_clicked[IDX_RIGHT];
+            btn_trigger_clicked[IDX_LEFT] = false;
+            btn_trigger_clicked[IDX_RIGHT] = false;
+            if (enable != web_auth_enabled) {
+                save_web_auth_enabled(enable);
+            }
+            oled_need_refresh = true;
+        }
+        btn_trigger_repeat[IDX_LEFT] = false;
+        btn_trigger_repeat[IDX_RIGHT] = false;
+    } else if (wifi_menu_cursor == 3) {
         if (btn_trigger_clicked[IDX_LEFT] || btn_trigger_repeat[IDX_LEFT]) {
             btn_trigger_clicked[IDX_LEFT] = false;
             btn_trigger_repeat[IDX_LEFT] = false;
             if (default_rec_fmt > 0) {
                 default_rec_fmt = (RecFormat)(default_rec_fmt - 1);
             } else {
-                default_rec_fmt = (RecFormat)(3);  // ★ P6(3)へループ
+                default_rec_fmt = (RecFormat)(FMT_MAX - 1);  // 最後へループ
             }
             save_rec_format_to_eeprom();
             oled_need_refresh = true;
@@ -475,13 +507,13 @@ void handle_wifi_menu_input() {
         if (btn_trigger_clicked[IDX_RIGHT] || btn_trigger_repeat[IDX_RIGHT]) {
             btn_trigger_clicked[IDX_RIGHT] = false;
             btn_trigger_repeat[IDX_RIGHT] = false;
-            default_rec_fmt = (RecFormat)((default_rec_fmt + 1) % 4);
+            default_rec_fmt = (RecFormat)((default_rec_fmt + 1) % FMT_MAX);
             save_rec_format_to_eeprom();
             oled_need_refresh = true;
         }
     }
 
-    if (wifi_menu_cursor != 0 && wifi_menu_cursor != 2) {
+    if (wifi_menu_cursor == 1) {
         if (!btn_trigger_clicked[IDX_OK] && !btn_trigger_repeat[IDX_RIGHT]) {
             return;
         }
@@ -495,7 +527,7 @@ void handle_wifi_menu_input() {
     }
 
     if (wifi_menu_cursor == 0) {
-        if (wifi_opt_sel == 0) {  // CLEAR
+        if (wifi_opt_sel == 0) {
             memset(wifi_password, 0, sizeof(wifi_password));
             memset(wifi_ssid, 0, sizeof(wifi_ssid));
 
@@ -505,166 +537,80 @@ void handle_wifi_menu_input() {
             wifi_user_enabled = false;
             wifi_disconnect_requested = true;
             wifi_menu_cursor = 1;
-            wifi_opt_sel = 1;  // 削除後は安全なOFFに戻す
+            wifi_opt_sel = 1;
             oled_need_refresh = true;
             return;
-        } else if (wifi_opt_sel == 1) {  // OFF
+        } else if (wifi_opt_sel == 1) {
             if (wifi_user_enabled) {
                 wifi_user_enabled = false;
-                wifi_connect_with_pin_requested = false;
+                wifi_connect_requested = false;
                 wifi_disconnect_requested = true;
             }
+            save_wifi_auto_connect(false);
             oled_need_refresh = true;
             return;
-        } else if (wifi_opt_sel == 2) {  // ON
+        } else if (wifi_opt_sel == 2) {
             if (!wifi_user_enabled) {
-                wifi_config_pos = 0;
-                memset(wifi_pin, 0, sizeof(wifi_pin));
-                wifi_pin[4] = '\0';
-                wifi_settings_pin_requested = false;
-                current_state = STATE_WIFI_PIN_CONNECT;
+                wifi_user_enabled = true;
+                wifi_connect_requested = true;
                 oled_need_refresh = true;
             }
+            save_wifi_auto_connect(true);
             return;
         }
     }
 
     if (wifi_menu_cursor == 1) {
-        if (wifi_settings_saved) {
-            wifi_config_pos = 0;
-            memset(wifi_pin, 0, sizeof(wifi_pin));
-            wifi_pin[4] = '\0';
-            wifi_settings_pin_requested = true;
-            current_state = STATE_WIFI_PIN_CONNECT;
-            oled_need_refresh = true;
-            return;
+        // 保存されている設定を読み直して編集する (未保存なら空から)
+        if (!wifi_settings_saved || !load_wifi_settings_from_flash()) {
+            memset(wifi_ssid, 0, sizeof(wifi_ssid));
+            memset(wifi_password, 0, sizeof(wifi_password));
         }
-
         wifi_config_field = 0;
         wifi_config_pos = 0;
-        memset(wifi_password, 0, sizeof(wifi_password));
-        memset(wifi_pin, 0, sizeof(wifi_pin));
-        wifi_pin[4] = '\0';
         wifi_scan_requested = true;
         current_state = STATE_WIFI_CONFIG;
-        oled_need_refresh = true;
-    }
-}
-
-void handle_wifi_pin_connect_input() {
-    if (wifi_config_pos < 0) {
-        wifi_config_pos = 0;
-    }
-    if (wifi_config_pos > 3) {
-        wifi_config_pos = 3;
-    }
-
-    if (wifi_pin_connect_confirm_pending) {
-        wifi_pin_connect_confirm_pending = false;
-        wifi_pin[4] = '\0';
-        if (wifi_settings_pin_requested) {
-            refresh_wifi_session_key_from_pin();
-            bool loaded = load_wifi_settings_from_flash();
-            if (loaded) {
-                wifi_scan_requested = true;
-                wifi_config_field = 0;
-                wifi_config_pos = 0;
-                wifi_settings_pin_requested = false;
-                current_state = STATE_WIFI_CONFIG;
-                reset_and_ignore_pressed_buttons();
-            } else {
-                wifi_settings_pin_requested = false;
-                wifi_config_field = 0;
-                wifi_config_pos = 0;
-                memset(wifi_password, 0, sizeof(wifi_password));
-                memset(wifi_ssid, 0, sizeof(wifi_ssid));
-                current_state = STATE_WIFI_CONFIG;
-                reset_and_ignore_pressed_buttons();
-            }
-        } else {
-            wifi_user_enabled = true;
-            wifi_connect_with_pin_requested = true;
-            current_state = STATE_WIFI_MENU;
-            reset_and_ignore_pressed_buttons();
-        }
         oled_need_refresh = true;
         return;
     }
 
-    if (btn_trigger_clicked[IDX_STOP]) {
-        btn_trigger_clicked[IDX_STOP] = false;
-        wifi_pin_connect_confirm_pending = false;
+    if (wifi_menu_cursor == 2) {
+        memset(web_password_edit, 0, sizeof(web_password_edit));
+        strncpy(web_password_edit, web_password, WEB_PASSWORD_MAX_LEN);
+        wifi_config_pos = 0;
+        current_state = STATE_WEB_PASS_CONFIG;
+        reset_and_ignore_pressed_buttons();
+        oled_need_refresh = true;
+    }
+}
+
+void handle_web_pass_config_input() {
+    if (btn_trigger_clicked[IDX_STOP] || btn_trigger_clicked[IDX_CANCEL]) {
         current_state = STATE_WIFI_MENU;
         reset_and_ignore_pressed_buttons();
         oled_need_refresh = true;
         return;
     }
 
-    if (btn_trigger_clicked[IDX_REC]) {
-        btn_trigger_clicked[IDX_REC] = false;
-        for (int i = 0; i < 4; i++) {
-            if (wifi_pin[i] < '0' || wifi_pin[i] > '9') {
-                wifi_pin[i] = '0';
-            }
+    if (btn_trigger_clicked[IDX_OK] || btn_trigger_clicked[IDX_REC]) {
+        web_password_edit[WEB_PASSWORD_MAX_LEN] = '\0';
+        // この入力方式では文字を消せないので、末尾の空白は消した扱いにする
+        // (すべて空白なら空になり、初期値に戻る)
+        for (int i = (int)strlen(web_password_edit) - 1;
+             i >= 0 && web_password_edit[i] == ' '; i--) {
+            web_password_edit[i] = '\0';
         }
-        wifi_pin[4] = '\0';
-        wifi_ui_blink_on = true;
-        wifi_pin_connect_confirm_pending = true;
+        wifi_save_result_success = save_web_password(web_password_edit);
+        settings_save_result_label = "Web password";
+        settings_save_return_cursor = 2;
+        wifi_save_result_until_ms = millis() + WIFI_SAVE_STATUS_DISPLAY_MS;
+        current_state = STATE_WIFI_SAVE_RESULT;
+        reset_and_ignore_pressed_buttons();
         oled_need_refresh = true;
         return;
     }
 
-    if (consume_wifi_edit_button(IDX_UP)) {
-        wifi_pin[wifi_config_pos] =
-            rotate_pin_digit(wifi_pin[wifi_config_pos], +1);
-        oled_need_refresh = true;
-    }
-
-    if (consume_wifi_edit_button(IDX_DOWN)) {
-        wifi_pin[wifi_config_pos] =
-            rotate_pin_digit(wifi_pin[wifi_config_pos], -1);
-        oled_need_refresh = true;
-    }
-
-    if (btn_trigger_clicked[IDX_RIGHT]) {
-        btn_trigger_clicked[IDX_RIGHT] = false;
-        if (wifi_config_pos < 3) {
-            wifi_config_pos++;
-        } else {
-            wifi_ui_blink_on = true;
-            wifi_pin_connect_confirm_pending = true;
-            oled_need_refresh = true;
-            return;
-        }
-        oled_need_refresh = true;
-    }
-
-    if (btn_trigger_clicked[IDX_LEFT]) {
-        btn_trigger_clicked[IDX_LEFT] = false;
-        if (wifi_config_pos > 0) {
-            wifi_config_pos--;
-        } else {
-            wifi_pin_connect_confirm_pending = false;
-            wifi_settings_pin_requested = false;
-            current_state = STATE_WIFI_MENU;
-            reset_and_ignore_pressed_buttons();
-        }
-        oled_need_refresh = true;
-    }
-
-    if (btn_trigger_clicked[IDX_OK]) {
-        btn_trigger_clicked[IDX_OK] = false;
-        for (int i = 0; i < 4; i++) {
-            if (wifi_pin[i] < '0' || wifi_pin[i] > '9') {
-                wifi_pin[i] = '0';
-            }
-        }
-        wifi_pin[4] = '\0';
-        wifi_ui_blink_on = true;
-        wifi_pin_connect_confirm_pending = true;
-        oled_need_refresh = true;
-        return;
-    }
+    edit_text_buffer(web_password_edit, WEB_PASSWORD_MAX_LEN);
 }
 
 void handle_wifi_config_input() {
@@ -686,15 +632,9 @@ void handle_wifi_config_input() {
         btn_trigger_repeat[IDX_REC] = false;
 
         if (wifi_ssid[0] != '\0') {
-            for (int i = 0; i < 4; i++) {
-                if (wifi_pin[i] < '0' || wifi_pin[i] > '9') {
-                    wifi_pin[i] = '0';
-                }
-            }
-            wifi_pin[4] = '\0';
-            wifi_config_field = 2;
-            wifi_ui_blink_on = true;
-            wifi_pin_save_confirm_pending = true;
+            wifi_ssid[32] = '\0';
+            wifi_password[64] = '\0';
+            wifi_config_apply_requested = true;
             oled_need_refresh = true;
             return;
         }
@@ -736,6 +676,8 @@ void handle_wifi_config_input() {
         if (btn_trigger_clicked[IDX_OK]) {
             btn_trigger_clicked[IDX_OK] = false;
             if (wifi_scan_count > 0) {
+                // パスワードは空から入力する (この入力方式では文字を消せないため)
+                memset(wifi_password, 0, sizeof(wifi_password));
                 snprintf(wifi_ssid, 33, "%s",
                          wifi_scan_ssids[wifi_scan_cursor]);
                 wifi_config_field = 1;
@@ -747,90 +689,9 @@ void handle_wifi_config_input() {
         return;
     }
 
-    if (wifi_config_field == 2) {
-        if (wifi_config_pos < 0) {
-            wifi_config_pos = 0;
-        }
-        if (wifi_config_pos > 3) {
-            wifi_config_pos = 3;
-        }
-
-        if (wifi_pin_save_confirm_pending) {
-            wifi_pin_save_confirm_pending = false;
-            wifi_ssid[32] = '\0';
-            wifi_password[64] = '\0';
-            wifi_pin[4] = '\0';
-            wifi_config_apply_requested = true;
-            oled_need_refresh = true;
-            return;
-        }
-
-        if (btn_trigger_clicked[IDX_OK]) {
-            btn_trigger_clicked[IDX_OK] = false;
-            for (int i = 0; i < 4; i++) {
-                if (wifi_pin[i] < '0' || wifi_pin[i] > '9') {
-                    wifi_pin[i] = '0';
-                }
-            }
-            wifi_pin[4] = '\0';
-            wifi_ui_blink_on = true;
-            wifi_pin_save_confirm_pending = true;
-            oled_need_refresh = true;
-            return;
-        }
-
-        if (consume_wifi_edit_button(IDX_CANCEL)) {
-            wifi_pin_save_confirm_pending = false;
-            wifi_config_field = 1;
-            wifi_config_pos = 0;
-            oled_need_refresh = true;
-        }
-
-        if (consume_wifi_edit_button(IDX_UP)) {
-            wifi_pin[wifi_config_pos] =
-                rotate_pin_digit(wifi_pin[wifi_config_pos], +1);
-            oled_need_refresh = true;
-        }
-
-        if (consume_wifi_edit_button(IDX_DOWN)) {
-            wifi_pin[wifi_config_pos] =
-                rotate_pin_digit(wifi_pin[wifi_config_pos], -1);
-            oled_need_refresh = true;
-        }
-
-        if (btn_trigger_clicked[IDX_RIGHT]) {
-            btn_trigger_clicked[IDX_RIGHT] = false;
-            if (wifi_config_pos < 3) {
-                wifi_config_pos++;
-            }
-            oled_need_refresh = true;
-        }
-
-        if (btn_trigger_clicked[IDX_LEFT]) {
-            btn_trigger_clicked[IDX_LEFT] = false;
-            if (wifi_config_pos > 0) {
-                wifi_config_pos--;
-            } else {
-                wifi_pin_save_confirm_pending = false;
-                wifi_config_field = 1;
-                wifi_config_pos = 0;
-            }
-            oled_need_refresh = true;
-        }
-
-        return;
-    }
-
     char* active_buf = NULL;
     int max_len = 0;
     get_active_wifi_buffer(&active_buf, &max_len);
-
-    if (wifi_config_pos < 0) {
-        wifi_config_pos = 0;
-    }
-    if (wifi_config_pos >= max_len) {
-        wifi_config_pos = max_len - 1;
-    }
 
     if (btn_trigger_clicked[IDX_CANCEL]) {
         btn_trigger_clicked[IDX_CANCEL] = false;
@@ -840,42 +701,18 @@ void handle_wifi_config_input() {
         return;
     }
 
+    // パスワード欄で OK を押したら保存する
     if (btn_trigger_clicked[IDX_OK]) {
         btn_trigger_clicked[IDX_OK] = false;
-        wifi_config_field = 2;
-        wifi_config_pos = 0;
+        wifi_ssid[32] = '\0';
+        wifi_password[64] = '\0';
+        wifi_config_apply_requested = true;
         oled_need_refresh = true;
         return;
     }
 
-    if (consume_wifi_edit_button(IDX_UP)) {
-        active_buf[wifi_config_pos] =
-            rotate_wifi_char(active_buf[wifi_config_pos], +1);
-        oled_need_refresh = true;
-    }
-
-    if (consume_wifi_edit_button(IDX_DOWN)) {
-        active_buf[wifi_config_pos] =
-            rotate_wifi_char(active_buf[wifi_config_pos], -1);
-        oled_need_refresh = true;
-    }
-
-    if (btn_trigger_clicked[IDX_RIGHT]) {
-        btn_trigger_clicked[IDX_RIGHT] = false;
-        if (wifi_config_pos < (max_len - 1)) {
-            wifi_config_pos++;
-        }
-        oled_need_refresh = true;
-    }
-
-    if (btn_trigger_clicked[IDX_LEFT]) {
-        btn_trigger_clicked[IDX_LEFT] = false;
-        if (wifi_config_pos > 0) {
-            wifi_config_pos--;
-        } else {
-            wifi_config_field = 0;
-        }
-        oled_need_refresh = true;
+    if (edit_text_buffer(active_buf, max_len)) {
+        wifi_config_field = 0;
     }
 }
 
@@ -959,9 +796,6 @@ void handle_ui_buttons_in_standby() {
 
     if (btn_trigger_clicked[IDX_OK] || btn_trigger_clicked[IDX_PLAY] ||
         btn_trigger_clicked[IDX_REC]) {
-        bool resume_requested = btn_trigger_clicked[IDX_OK] ||
-                                btn_trigger_clicked[IDX_PLAY] ||
-                                btn_trigger_clicked[IDX_REC];
         btn_trigger_clicked[IDX_OK] = false;
         btn_trigger_clicked[IDX_PLAY] = false;
         btn_trigger_clicked[IDX_REC] = false;

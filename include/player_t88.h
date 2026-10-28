@@ -27,6 +27,8 @@ class PlayerT88 : public CmtPlayer {
     bool playback_lock_start_ticks;
 
     bool waiting_for_silence;
+    uint32_t silence_values;  // 無音のために入れた値の数 (PIO の High/Low の偶奇を数える用)
+    bool silence_started;  // 無音の計時を始めたか
     uint32_t silence_start_ms;
     uint32_t silence_target_ms;
 
@@ -40,7 +42,7 @@ class PlayerT88 : public CmtPlayer {
     bool begin_next_data_tag_bit();
     bool emit_pulses_from_data_tag(queue_t* play_queue);
     void fill_queue(queue_t* play_queue);
-    bool scan_for_blank_tag(uint32_t current_pos, int direction,
+    bool scan_for_blank_tag(int direction,
                             uint32_t* target_pos);
 
    public:

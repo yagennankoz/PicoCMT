@@ -87,6 +87,7 @@ class CasFskDemodulator {
 
         // 半波合成
         uint32_t full_us = 0;
+        uint32_t prev_half_us = 0;
         if (!has_pending_half) {
             pending_is_high = is_high;
             pending_us = pulse_us;
@@ -94,6 +95,7 @@ class CasFskDemodulator {
         } else {
             if (pending_is_high != is_high) {
                 full_us = pending_us + pulse_us;
+                prev_half_us = pending_us;
                 pending_is_high = is_high;
                 pending_us = pulse_us;
             } else {
@@ -141,9 +143,12 @@ class CasFskDemodulator {
                 return;  // キャリア未検出時はここで終了
             } else {
                 // キャリア検出済みなら、DPLLでウィンドウ幅をテープ速度に追従
-                if (uart_state == 0) {  // アイドル(Mark)中のみ
-                    bool is_space_full = (full_us >= (space_threshold_us * 2));
-                    uint32_t est_win = is_space_full ? full_us : (full_us * 2);
+                // 同じ種類の半周期が2つ並んだ組だけで測る。Mark と Space が混ざった組
+                // (スタートビットの境目など) は1ビットの長さと関係がない
+                bool prev_space = (prev_half_us >= space_threshold_us);
+                bool cur_space = (pulse_us >= space_threshold_us);
+                if (uart_state == 0 && prev_space == cur_space) {  // アイドル(Mark)中のみ
+                    uint32_t est_win = cur_space ? full_us : (full_us * 2);
                     if (est_win > dpll_min_us && est_win < dpll_max_us) {
                         current_window_us =
                             (current_window_us * 15 + est_win) / 16;
@@ -280,14 +285,28 @@ bool convert_raw_to_cas(const char* raw_path, const char* cas_path) {
     CasFskDemodulator demod;
 
     uint64_t last_byte_time = 0;
+    uint32_t written = 0;  // 書き込んだバイト数 (シグネチャの位置合わせ用)
+    bool write_ok = true;  // SDへの書き込みに失敗したら false
+
+    auto write = [&](const uint8_t* data, size_t len) {
+        if (!writer->write_bytes(data, len)) {
+            write_ok = false;
+        }
+        written += len;
+    };
 
     demod.on_byte_decoded = [&](uint8_t byte_val) {
         // ドロップアウト対策: 無音ギャップの判定を 1秒(1000000us) に延長
         if (last_byte_time == 0 ||
             demod.current_time_us - last_byte_time > 1000000) {
-            writer->write_bytes(CAS_SIGNATURE, 8);
+            // シグネチャは8の倍数の位置に置く (そうでないとヘッダとして認識されない)
+            static const uint8_t PADDING[8] = {0};
+            if (written % 8 != 0) {
+                write(PADDING, 8 - (written % 8));
+            }
+            write(CAS_SIGNATURE, 8);
         }
-        writer->write_bytes(&byte_val, 1);
+        write(&byte_val, 1);
         last_byte_time = demod.current_time_us;
     };
 
@@ -295,7 +314,7 @@ bool convert_raw_to_cas(const char* raw_path, const char* cas_path) {
     uint32_t loop_count = 0;
     int last_percent = -1;
 
-    while (reader->read_word(raw_word)) {
+    while (write_ok && reader->read_word(raw_word)) {
         loop_count++;
         if ((loop_count & 0x01FF) == 0) {
             watchdog_update();
@@ -323,16 +342,18 @@ bool convert_raw_to_cas(const char* raw_path, const char* cas_path) {
         }
 
         bool is_high = (raw_word & 0x8000) != 0;
-        uint32_t pulse_us = pio_ticks_to_us((uint32_t)(raw_word & 0x7FFF));
+        uint32_t pulse_us = raw_pulse_us(raw_word);
         demod.feed_pulse(is_high, pulse_us);
     }
 
-    writer->flush();
+    if (!writer->flush()) {
+        write_ok = false;
+    }
     delete writer;
     delete reader;
     raw_file.close();
     cas_file.close();
 
     draw_conversion_progress(100);
-    return true;
+    return write_ok;
 }

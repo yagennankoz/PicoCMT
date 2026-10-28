@@ -36,12 +36,14 @@ class PlayerCAS : public CmtPlayer {
 
     char playback_log[24];
     uint32_t start_ms;
+    bool blank_started;  // 無音の計時を始めたか
 
     int baud_rate;
     uint16_t mark_pulse_us;
     uint16_t space_pulse_us;
 
     bool enqueue_pulse(queue_t* q, uint16_t us);
+    void enqueue_silence(queue_t* q);
     void set_log(const char* text);
 
    public:

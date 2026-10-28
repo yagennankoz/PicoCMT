@@ -81,16 +81,7 @@ void scan_remote_hardware() {
             if (now - remote_stable_time > required_stable_time) {
                 current_remote_state = target_state;
                 remote_stable_time = 0;
-
-                if (current_remote_state == REMOTE_ON) {
-                    remote_hardware_on = true;
-                } else {
-                    remote_hardware_on = false;
-                    if (manual_ok_override) {
-                        manual_ok_override = false;
-                    }
-                }
-                update_system_run_permissions();
+                handle_remote_change_event(current_remote_state);
             }
         }
     } else {

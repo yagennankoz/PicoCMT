@@ -12,15 +12,27 @@ class PlayerT77 : public CmtPlayer {
     SdBufferedRead* buffered_reader;
     bool end_reached;
     bool exhausted;
+    bool file_eof;
 
-    uint32_t accumulated_clocks;
-    bool waiting_for_silence;
-    uint32_t silence_start_ms;
-    uint32_t silence_target_ms;
+    // 読み込み中のパルス (同じレベルが続くワードをまとめたもの)
+    bool has_current;
+    bool current_level;
+    uint64_t total_ticks;  // 読み込み済みカウントの累計
+    uint64_t emitted_us;   // キューへ渡し終えた時間の累計
+
+    // キューに入りきらなかったパルスの残り
+    bool pend_level;
+    uint32_t pend_us;
+
+    // 次にキューへ入れた値が出力されるレベル (PIOは値ごとにH/Lを反転する)
+    bool out_high_next;
 
     char playback_log[24];
 
-    bool enqueue_pulse(queue_t* q, uint16_t us);
+    void reset_state();
+    bool enqueue_raw(queue_t* q, uint16_t us);
+    void close_current();
+    bool drain_pending(queue_t* q);
     void set_log(const char* text);
 
    public:

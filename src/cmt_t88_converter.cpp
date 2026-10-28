@@ -282,6 +282,8 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
         return true;
     };
 
+    bool write_ok = true;  // SDへの書き込みに失敗したら false
+
     demod.on_byte_decoded = [&](uint8_t byte_val) {
         if (data_payload_count < CONV_MAX_DATA_PAYLOAD) {
             data_payload[data_payload_count++] = byte_val;
@@ -289,7 +291,9 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
         last_data_end_us = demod.current_time_us;
 
         if (data_payload_count >= CONV_MAX_DATA_PAYLOAD) {
-            flush_block(demod.current_time_us);
+            if (!flush_block(demod.current_time_us)) {
+                write_ok = false;
+            }
             block_type = TAG_TYPE_DATA;
         }
     };
@@ -297,7 +301,7 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
     uint16_t raw_word = 0;
     uint32_t loop_count = 0;
 
-    while (reader->read_word(raw_word)) {
+    while (write_ok && reader->read_word(raw_word)) {
         loop_count++;
         if ((loop_count & 0x01FF) == 0) {
             watchdog_update();
@@ -325,6 +329,7 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
             loop_count++;
 
             uint64_t silence_us = ms_word * 1000ULL;
+            demod.finish();  // ボーレート判定中のバイトを先に確定させる
             if (!flush_block(demod.current_time_us)) {
                 cleanup();
                 return false;
@@ -343,11 +348,13 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
         }
 
         bool is_high = (raw_word & 0x8000) != 0;
-        uint32_t pulse_us = pio_ticks_to_us((uint32_t)(raw_word & 0x7FFF));
+        uint32_t pulse_us = raw_pulse_us(raw_word);
 
         demod.feed_pulse(is_high, pulse_us);
 
-        bool is_idle = (demod.uart_state == 0);
+        // ボーレート判定のために半周期をためている間もデータとして扱う
+        // (ためている間は current_time_us がスタートビットの開始時刻のまま)
+        bool is_idle = (demod.uart_state == 0) && !demod.buffering_baud;
         bool is_space = (pulse_us >= 312);
         TagType current_type = is_idle
                                    ? (is_space ? TAG_TYPE_SPACE : TAG_TYPE_MARK)
@@ -355,13 +362,17 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
 
         if (block_type == TAG_TYPE_DATA) {
             if (current_type != TAG_TYPE_DATA) {
-                if (demod.current_time_us - last_data_end_us > 100000) {
-                    if (!flush_block(last_data_end_us)) {
+                if (demod.current_time_us - last_data_end_us > T88_DATA_GAP_US) {
+                    // バイトが1つも無かった場合 (誤検出) にブロック開始より前へ戻さない
+                    uint64_t data_end_us = (last_data_end_us > block_start_us)
+                                               ? last_data_end_us
+                                               : block_start_us;
+                    if (!flush_block(data_end_us)) {
                         cleanup();
                         return false;
                     }
                     block_type = current_type;
-                    block_start_us = last_data_end_us;
+                    block_start_us = data_end_us;
                 }
             }
         } else {
@@ -373,7 +384,10 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
                 block_type = current_type;
             } else if (current_type == TAG_TYPE_DATA &&
                        block_type != TAG_TYPE_DATA) {
-                if (!flush_block(demod.window_start_us)) {
+                uint64_t data_start_us = demod.buffering_baud
+                                             ? demod.current_time_us
+                                             : demod.window_start_us;
+                if (!flush_block(data_start_us)) {
                     cleanup();
                     return false;
                 }
@@ -382,16 +396,120 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
         }
     }
 
+    demod.finish();
     if (!flush_block(demod.current_time_us)) {
         cleanup();
         return false;
     }
 
-    tag_writer->write_end();
-    writer->flush();
+    if (!tag_writer->write_end() || !writer->flush()) {
+        write_ok = false;
+    }
 
     draw_conversion_progress(100);
 
     cleanup();
+    return write_ok;
+}
+
+
+// ============================================================================
+// 追記 (2つの T88 を1つにつなぐ)
+// ============================================================================
+// src の先頭24バイト (シグネチャ) の後のタグを、END の手前まで writer に写す。
+// 時刻を持つタグ (0x0100 以上、長さ8以上) は開始時刻に shift を足す。
+// end_ticks には、写したタグの終わりの時刻 (開始 + 長さ) の最大値を入れる
+static bool copy_t88_tags(File& src, SdBufferedWrite& writer, uint32_t shift,
+                          bool skip_version, uint32_t& end_ticks) {
+    uint8_t buf[256];
+    if (src.read(buf, 24) != 24 || memcmp(buf, T88_SIGNATURE, 24) != 0) {
+        return false;
+    }
+    end_ticks = 0;
+    while (src.available()) {
+        watchdog_update();
+        uint8_t head[4];
+        if (src.read(head, 4) != 4) {
+            break;
+        }
+        uint16_t id = (uint16_t)(head[0] | (head[1] << 8));
+        uint16_t size = (uint16_t)(head[2] | (head[3] << 8));
+        if (id == T88_TAG_END) {
+            break;
+        }
+        bool write = !(skip_version && id == T88_TAG_VERSION);
+        if (write && !writer.write_bytes(head, 4)) {
+            return false;
+        }
+        uint32_t left = size;
+        if (id >= 0x0100 && size >= 8) {
+            if (src.read(buf, 8) != 8) {
+                return false;
+            }
+            uint32_t start = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) |
+                             ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+            uint32_t len = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8) |
+                           ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
+            if (start + len > end_ticks) {
+                end_ticks = start + len;
+            }
+            start += shift;
+            buf[0] = start & 0xFF;
+            buf[1] = (start >> 8) & 0xFF;
+            buf[2] = (start >> 16) & 0xFF;
+            buf[3] = (start >> 24) & 0xFF;
+            if (write && !writer.write_bytes(buf, 8)) {
+                return false;
+            }
+            left -= 8;
+        }
+        while (left > 0) {
+            uint32_t n = (left > sizeof(buf)) ? sizeof(buf) : left;
+            if (src.read(buf, n) != (int)n) {
+                return false;
+            }
+            if (write && !writer.write_bytes(buf, n)) {
+                return false;
+            }
+            left -= n;
+        }
+    }
     return true;
+}
+
+bool t88_append(const char* base_path, const char* add_path, const char* out_path) {
+    File base = SD.open(base_path, FILE_READ);
+    File add = SD.open(add_path, FILE_READ);
+    if (SD.exists(out_path)) {
+        SD.remove(out_path);
+    }
+    File out = SD.open(out_path, FILE_WRITE);
+    bool ok = base && add && out;
+
+    if (ok) {
+        SdBufferedWrite* writer = new SdBufferedWrite(&out);
+        uint32_t base_end = 0, add_end = 0;
+        // 1. 元のファイル (シグネチャ + タグ)
+        ok = writer->write_bytes((const uint8_t*)T88_SIGNATURE, 24) &&
+             copy_t88_tags(base, *writer, 0, false, base_end);
+        // 2. 境目に無音 (BLANK) を入れる
+        ok = ok && write_t88_carrier_tag(*writer, T88_TAG_BLANK, base_end,
+                                         T88_APPEND_BLANK_TICKS);
+        // 3. 追加するファイルのタグ (VERSION を除き、時刻を後ろへずらす)
+        ok = ok && copy_t88_tags(add, *writer, base_end + T88_APPEND_BLANK_TICKS, true,
+                                 add_end);
+        ok = ok && write_t88_end_tag(*writer);
+        ok = writer->flush() && ok;
+        delete writer;
+    }
+    if (base) {
+        base.close();
+    }
+    if (add) {
+        add.close();
+    }
+    if (out) {
+        out.close();
+    }
+    return ok;
 }

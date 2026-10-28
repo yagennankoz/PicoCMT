@@ -13,6 +13,7 @@
 #include "pico/util/queue.h"
 #include "player_cas.h"
 #include "player_cmt.h"
+#include "player_p6t.h"
 #include "player_t77.h"
 #include "player_t88.h"
 
@@ -35,7 +36,7 @@ static void wait_for_core1_playback_shutdown() {
     uint32_t sync_timeout = millis();
     while (millis() - sync_timeout < 100) {
         bool session_inited = true;
-        get_core1_playback_stats(&session_inited, NULL, NULL, NULL);
+        get_core1_playback_stats(&session_inited, NULL, NULL);
         if (!session_inited) {
             break;
         }
@@ -62,7 +63,7 @@ bool jump_playback_to_blank(int direction) {
         play_paused = false;
         play_active = true;
         playback_permitted = true;
-        playback_tag_start_system_ms = millis();  // ★時間再開
+        playback_tag_start_system_ms = millis();  // 経過時間の計測を再開
         init_core1_playback_prime();
         return false;
     }
@@ -71,7 +72,7 @@ bool jump_playback_to_blank(int direction) {
     play_paused = false;
     play_active = true;
     playback_permitted = true;
-    playback_tag_start_system_ms = millis();  // ★時間再開
+    playback_tag_start_system_ms = millis();  // 経過時間の計測を再開
 
     init_core1_playback_prime();
     return true;
@@ -134,11 +135,9 @@ void get_playback_status(PlaybackStatus* out) {
     out->queue_level = queue_get_level(&cmt_play_queue);
     out->queue_free_space = PLAY_QUEUE_LENGTH - out->queue_level;
 
-    get_core1_playback_stats(
-        &out->core1_play_session_initialized, &out->core1_play_swap_count,
-        &out->core1_play_last_t88_data, &out->core1_play_using_buffer_a);
-    get_core1_playback_io_stats(&out->core1_pio_enabled, &out->core1_dma_busy,
-                                &out->core1_gpio_level);
+    get_core1_playback_stats(&out->core1_play_session_initialized,
+                             &out->core1_play_swap_count, &out->core1_play_last_t88_data);
+    get_core1_playback_io_stats(&out->core1_pio_enabled, &out->core1_gpio_level);
 }
 
 void handle_sd_playback_stream() {
@@ -189,6 +188,9 @@ bool start_playback_file(const char* filename) {
             ((PlayerCAS*)active_player)->set_baud_rate(cas_selected_baud_rate);
         } else if (strcasecmp(ext, ".T77") == 0) {
             active_player = new PlayerT77();
+        } else if (strcasecmp(ext, ".P6T") == 0) {
+            // ボーレートはブロックごとにファイルに入っている
+            active_player = new PlayerP6T();
         } else if (strcasecmp(ext, ".CMT") == 0 ||
                    strcasecmp(ext, ".P6") == 0) {
             active_player = new PlayerCMT();
@@ -283,7 +285,7 @@ bool load_directory(const String& path) {
             if (!ext ||
                 (strcasecmp(ext, ".T88") != 0 && strcasecmp(ext, ".CAS") != 0 &&
                  strcasecmp(ext, ".T77") != 0 && strcasecmp(ext, ".CMT") != 0 &&
-                 strcasecmp(ext, ".P6") != 0)) {
+                 strcasecmp(ext, ".P6") != 0 && strcasecmp(ext, ".P6T") != 0)) {
                 entry.close();
                 continue;
             }

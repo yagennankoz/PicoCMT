@@ -5,11 +5,10 @@
 #include "cmt_globals.h"
 #include "cmt_hw_config.h"
 
+// T88のtick数から再生キューに入れる値(us)を求める (再生PIOの命令オーバーヘッド分を引く)
 static uint16_t t88_ticks_to_us_u16(uint32_t ticks) {
     uint64_t us = ((uint64_t)ticks * 1000000ULL + 2400ULL) / 4800ULL;
-    if (us == 0) {
-        us = 1;
-    }
+    us = (us > PLAY_PIO_OVERHEAD_US) ? us - PLAY_PIO_OVERHEAD_US : 0;
     if (us > 65535ULL) {
         us = 65535ULL;
     }
@@ -106,6 +105,8 @@ bool PlayerT88::init(File* f, const char* filename) {
     init_position_tracking();
 
     waiting_for_silence = false;
+    silence_values = 0;
+    silence_started = false;
     silence_start_ms = 0;
     silence_target_ms = 0;
 
@@ -144,6 +145,14 @@ bool PlayerT88::init(File* f, const char* filename) {
 
 void PlayerT88::process(queue_t* play_queue) {
     if (waiting_for_silence) {
+        // 無音は、キューに残っている信号を出し切ってから計り始める
+        if (!silence_started) {
+            if (!queue_is_empty(play_queue)) {
+                return;
+            }
+            silence_started = true;
+            silence_start_ms = millis();
+        }
         if (millis() - silence_start_ms >= silence_target_ms) {
             waiting_for_silence = false;
         } else {
@@ -404,10 +413,18 @@ void PlayerT88::fill_queue(queue_t* q) {
                 uint32_t gap_us =
                     (uint32_t)(((uint64_t)len_ticks * 1000000ULL) / 4800ULL);
                 if (gap_us >= 5000) {
+                    // 無音 (Core1 がキューの最後の値を2つずつ繰り返す)。PIO は値ごとに
+                    // High/Low を反転するので、それまでの値の数と合わせて偶数にし、
+                    // 無音の後の信号が必ず High の半周期から始まるようにする
                     uint16_t us_val = 2;
-                    queue_try_add(q, &us_val);
+                    int n = ((total_enqueued_pulses + silence_values) % 2 == 0) ? 2 : 1;
+                    for (int i = 0; i < n; i++) {
+                        if (queue_try_add(q, &us_val)) {
+                            silence_values++;
+                        }
+                    }
                     waiting_for_silence = true;
-                    silence_start_ms = millis();
+                    silence_started = false;
                     silence_target_ms = gap_us / 1000;
                     playback_tag_ticks_remaining = 0;
                     break;
@@ -464,7 +481,7 @@ void PlayerT88::fill_queue(queue_t* q) {
     }
 }
 
-bool PlayerT88::scan_for_blank_tag(uint32_t current_pos, int direction,
+bool PlayerT88::scan_for_blank_tag(int direction,
                                    uint32_t* target_pos) {
     if (target_pos == NULL || !buffered_reader) {
         return false;
@@ -573,10 +590,9 @@ bool PlayerT88::scan_for_blank_tag(uint32_t current_pos, int direction,
 }
 
 bool PlayerT88::seek(int direction, queue_t* q) {
-    uint32_t current_pos = buffered_reader->position();
     uint32_t target_pos = 0;
 
-    if (!scan_for_blank_tag(current_pos, direction, &target_pos)) {
+    if (!scan_for_blank_tag(direction, &target_pos)) {
         set_playback_log("SEEK ERR");
         return false;
     }
@@ -625,6 +641,7 @@ bool PlayerT88::seek(int direction, queue_t* q) {
     playback_queue_last_progress_ms = millis();
 
     waiting_for_silence = false;
+    silence_started = false;
 
     fill_queue(q);
 

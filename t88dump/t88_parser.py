@@ -1,8 +1,10 @@
 import struct
 import os
 
+from t77_parser import T77Analysis, T77_HEADER_LEN
+
 class TapeImageParser:
-    """T88, CMT, CASファイルのバイナリパースを専門に行うクラス"""
+    """T88, CMT, CAS, T77ファイルのバイナリパースを専門に行うクラス"""
     TAG_NAMES = {
         0x0000: "End of File (終了タグ)",
         0x0001: "Format Version (バージョン情報)",
@@ -17,6 +19,8 @@ class TapeImageParser:
         self.tags_info = []
         self.is_cmt_mode = False
         self.is_cas_mode = False
+        self.is_t77_mode = False
+        self.t77 = None
         self.filename = ""
         self.filesize = 0
 
@@ -37,10 +41,17 @@ class TapeImageParser:
 
         self.is_cmt_mode = False
         self.is_cas_mode = False
+        self.is_t77_mode = False
+        self.t77 = None
         self.tags_info = []
 
         if header_str == "PC-8801 Tape Image(T88)":
             self._parse_t88_tags()
+        elif self.file_data[:T77_HEADER_LEN].startswith(b"XM7 TAPE IMAGE"):
+            # FM-7 (XM7) のT77。波形データをデコードしてブロック単位に分割する
+            self.is_t77_mode = True
+            self.t77 = T77Analysis(self.file_data)
+            self.tags_info = self.t77.rows
         elif b"\x1F\xA6\xDE\xBA\xCC\x13\x7D\x74" in self.file_data:
             # 拡張子に依存せず、MSX/PC-6001系のマジックナンバーが存在すればCASとして解析
             self.is_cas_mode = True
@@ -154,7 +165,7 @@ class TapeImageParser:
             elif tag_id == 0x0101:
                 pure_data_bytes_count = f"{data_len:,}"
                 
-                # ★修正: データバイトの単純合算ではなくデータ量からTicksを計算する
+                # データ量からTicksを計算する
                 # 1200bps (1bit=4Ticks), 1バイト=11bit (スタート1+データ8+ストップ2) の場合=44Ticks
                 tag_duration_ticks = data_len * 44
 

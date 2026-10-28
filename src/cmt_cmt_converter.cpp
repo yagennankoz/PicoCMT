@@ -54,20 +54,29 @@ bool convert_raw_to_cmt(const char* raw_path, const char* cmt_path) {
     FskDemodulator demod;
     uint64_t last_data_end_us = 0;
     bool in_data_block = false;
+    bool write_ok = true;  // SDへの書き込みに失敗したら false
+
+    auto write_payload = [&]() {
+        if (data_payload_count > 0) {
+            if (!writer->write_bytes(data_payload, data_payload_count)) {
+                write_ok = false;
+            }
+            data_payload_count = 0;
+        }
+    };
 
     // データブロックをファイルに書き出すためのヘルパー関数
     auto flush_data_block = [&]() {
-        if (data_payload_count > 0) {
-            writer->write_bytes(data_payload, data_payload_count);
-            data_payload_count = 0;
-        }
+        write_payload();
         in_data_block = false;
     };
 
     // デコードされたバイトは、即時書き込まずバッファに溜める
+    // (バッファが一杯になったらブロックの途中でも書き出す)
     demod.on_byte_decoded = [&](uint8_t byte_val) {
-        if (data_payload_count < CONV_MAX_DATA_PAYLOAD) {
-            data_payload[data_payload_count++] = byte_val;
+        data_payload[data_payload_count++] = byte_val;
+        if (data_payload_count >= CONV_MAX_DATA_PAYLOAD) {
+            write_payload();
         }
         last_data_end_us = demod.current_time_us;
     };
@@ -75,7 +84,7 @@ bool convert_raw_to_cmt(const char* raw_path, const char* cmt_path) {
     uint16_t raw_word = 0;
     uint32_t loop_count = 0;
 
-    while (reader->read_word(raw_word)) {
+    while (write_ok && reader->read_word(raw_word)) {
         loop_count++;
         if ((loop_count & 0x01FF) == 0) {
             watchdog_update();
@@ -97,6 +106,7 @@ bool convert_raw_to_cmt(const char* raw_path, const char* cmt_path) {
 
         // 無音区間が来たら、それまでのデータブロックを書き出す
         if (raw_word == 0xFFFF) {
+            demod.finish();  // ボーレート判定中のバイトを先に確定させる
             flush_data_block();
             uint16_t ms_word = 100;
             if (!reader->read_word(ms_word)) {
@@ -108,7 +118,7 @@ bool convert_raw_to_cmt(const char* raw_path, const char* cmt_path) {
         }
 
         bool is_high = (raw_word & 0x8000) != 0;
-        uint32_t pulse_us = pio_ticks_to_us((uint32_t)(raw_word & 0x7FFF));
+        uint32_t pulse_us = raw_pulse_us(raw_word);
 
         demod.feed_pulse(is_high, pulse_us);
 
@@ -131,11 +141,14 @@ bool convert_raw_to_cmt(const char* raw_path, const char* cmt_path) {
     }
 
     // ファイル末尾に残っている可能性のあるデータを書き出す
+    demod.finish();
     flush_data_block();
 
-    writer->flush();
+    if (!writer->flush()) {
+        write_ok = false;
+    }
     draw_conversion_progress(100);
 
     cleanup();
-    return true;
+    return write_ok;
 }

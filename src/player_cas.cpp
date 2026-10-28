@@ -8,9 +8,9 @@
 static const uint8_t CAS_SIGNATURE[8] = {0x1F, 0xA6, 0xDE, 0xBA,
                                          0xCC, 0x13, 0x7D, 0x74};
 
-// PIOプログラムがパルスを出力する際にかかる命令オーバーヘッド(約7us)
+// PIOプログラムがパルスを出力する際にかかる命令オーバーヘッド
 // MSXの2400ボーは非常にシビアなため、この分を差し引いて波形を補正する
-#define PIO_OVERHEAD_US 7
+#define PIO_OVERHEAD_US PLAY_PIO_OVERHEAD_US
 
 PlayerCAS::PlayerCAS() {
     cmt_file = nullptr;
@@ -52,6 +52,14 @@ bool PlayerCAS::enqueue_pulse(queue_t* q, uint16_t us) {
     return res;
 }
 
+// 無音 (Core1 がキューの最後の値を2つずつ繰り返す)。
+// PIO は値ごとに High/Low を反転するので、値を2つ入れて数を偶数に保ち、
+// どのブロックも High の半周期から始まるようにする (1つだとブロックごとに位相が入れ替わる)
+void PlayerCAS::enqueue_silence(queue_t* q) {
+    enqueue_pulse(q, 2);
+    enqueue_pulse(q, 2);
+}
+
 bool PlayerCAS::init(File* f, const char* filename) {
     cmt_file = f;
 
@@ -74,6 +82,7 @@ bool PlayerCAS::init(File* f, const char* filename) {
     bit_index = -1;
     pulse_count = 0;
     start_ms = millis();
+    blank_started = false;
 
     // 最初の8バイトをウィンドウに先読みする
     window_filled = buffered_reader->read(window, 8);
@@ -123,13 +132,21 @@ void PlayerCAS::process(queue_t* play_queue) {
                 }
 
                 state = STATE_BLANK;
-                start_ms = millis();
-                enqueue_pulse(play_queue, 2);
+                blank_started = false;
+                enqueue_silence(play_queue);
                 set_log("CAS Blank");
                 break;
 
             case STATE_BLANK:
                 // ブロックの前に1秒間の無音（モーター動作の猶予）を挟む
+                // 無音は、キューに残っている信号を出し切ってから計り始める
+                if (!blank_started) {
+                    if (!queue_is_empty(play_queue)) {
+                        return;
+                    }
+                    blank_started = true;
+                    start_ms = millis();
+                }
                 if (millis() - start_ms >= 1000) {
                     state = STATE_HEADER;
                     pulse_count = 0;
@@ -214,7 +231,8 @@ void PlayerCAS::process(queue_t* play_queue) {
                                 phase_counter = 1800 * phase_multiplier;
                             }
                             state = STATE_BLANK;
-                            start_ms = millis();
+                            blank_started = false;
+                            enqueue_silence(play_queue);
                             set_log("CAS Blank");
                             break;  // 現在のバイト処理を終え、STATE_BLANKに遷移
                         }
