@@ -7,6 +7,9 @@
 // Web file manager (http://<WEB_MDNS_HOSTNAME>.local/)
 #define WEB_SERVER_PORT 80
 #define WEB_MDNS_HOSTNAME "picocmt"
+// mDNS で名前 (picocmt.local) を知らせ直す間隔。LEAmDNS は始めたときに 1秒おきに8回
+// 知らせた後は知らせないので、PC 側の覚えている期限 (120秒) より短い間隔で知らせ続ける
+#define WEB_MDNS_REANNOUNCE_MS 60000
 // Web login account (Basic認証)。設定メニューの Web Pass で ON/OFF とパスワードを変更できる
 #define WEB_AUTH_DEFAULT_ENABLED true
 #define WEB_USERNAME "pico"

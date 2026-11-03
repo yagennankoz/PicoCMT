@@ -8,6 +8,7 @@
 
 #include "cmt_cas_converter.h"
 #include "cmt_cmt_converter.h"
+#include "cmt_core1.h"
 #include "cmt_globals.h"
 #include "cmt_p6t_converter.h"
 #include "cmt_t77_converter.h"
@@ -479,6 +480,9 @@ void stop_raw_recording_and_finalize() {
     }
     recording_active = false;
     rec_paused = true;
+
+    // 録音中に値を取りこぼした回数 (0 でなければ RAW の High/Low の並びが崩れている)
+    log_core1_rec_stats();
 
     uint32_t raw_val;
     while (queue_try_remove(&cmt_data_queue, &raw_val)) {

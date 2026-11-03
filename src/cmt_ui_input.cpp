@@ -156,6 +156,25 @@ static bool edit_text_buffer(char* buf, int max_len) {
     return false;
 }
 
+// 設定メニューの Rec Fmt で選ぶ順番。RecFormat の番号は設定 (EEPROM) に保存しているので変えず、
+// 見せる順番だけをここで決める (機種ごとにまとめる: PC-8801 → MSX → PC-6001 → FM-7)
+static const RecFormat REC_FMT_MENU_ORDER[] = {FMT_T88, FMT_CMT, FMT_CAS, FMT_P6, FMT_P6T, FMT_T77};
+static_assert(sizeof(REC_FMT_MENU_ORDER) / sizeof(REC_FMT_MENU_ORDER[0]) == FMT_MAX,
+              "REC_FMT_MENU_ORDER");
+
+// メニューの順番で、前 (dir = -1) / 次 (dir = +1) の形式を返す (端ではループする)
+static RecFormat step_rec_format(RecFormat current, int dir) {
+    int pos = 0;
+    for (int i = 0; i < FMT_MAX; i++) {
+        if (REC_FMT_MENU_ORDER[i] == current) {
+            pos = i;
+            break;
+        }
+    }
+    pos = (pos + dir + FMT_MAX) % FMT_MAX;
+    return REC_FMT_MENU_ORDER[pos];
+}
+
 static void build_default_record_filename() {
     char candidate[sizeof(target_filename)] = {0};
     const char* ext_list[] = {".T88", ".CMT", ".CAS", ".P6", ".T77", ".P6T"};
@@ -496,18 +515,14 @@ void handle_wifi_menu_input() {
         if (btn_trigger_clicked[IDX_LEFT] || btn_trigger_repeat[IDX_LEFT]) {
             btn_trigger_clicked[IDX_LEFT] = false;
             btn_trigger_repeat[IDX_LEFT] = false;
-            if (default_rec_fmt > 0) {
-                default_rec_fmt = (RecFormat)(default_rec_fmt - 1);
-            } else {
-                default_rec_fmt = (RecFormat)(FMT_MAX - 1);  // 最後へループ
-            }
+            default_rec_fmt = step_rec_format(default_rec_fmt, -1);
             save_rec_format_to_eeprom();
             oled_need_refresh = true;
         }
         if (btn_trigger_clicked[IDX_RIGHT] || btn_trigger_repeat[IDX_RIGHT]) {
             btn_trigger_clicked[IDX_RIGHT] = false;
             btn_trigger_repeat[IDX_RIGHT] = false;
-            default_rec_fmt = (RecFormat)((default_rec_fmt + 1) % FMT_MAX);
+            default_rec_fmt = step_rec_format(default_rec_fmt, +1);
             save_rec_format_to_eeprom();
             oled_need_refresh = true;
         }

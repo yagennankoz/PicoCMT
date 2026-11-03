@@ -25,6 +25,7 @@
 static WebServer server(WEB_SERVER_PORT);
 static bool server_running = false;
 static bool mdns_running = false;
+static uint32_t mdns_last_announce_ms = 0;
 static bool routes_registered = false;
 
 // アップロード中の状態 (WebServer は1つずつしか処理しないので1組で足りる)
@@ -460,6 +461,7 @@ void web_server_start() {
     if (MDNS.begin(WEB_MDNS_HOSTNAME)) {
         MDNS.addService("http", "tcp", WEB_SERVER_PORT);
         mdns_running = true;
+        mdns_last_announce_ms = millis();
     }
     WEB_LOG("Web server started: http://%s.local/ (http://%s/)", WEB_MDNS_HOSTNAME,
             WiFi.localIP().toString().c_str());
@@ -486,6 +488,11 @@ void web_server_handle(bool allow_requests) {
     }
     if (mdns_running) {
         MDNS.update();
+        uint32_t now_ms = millis();
+        if (now_ms - mdns_last_announce_ms >= WEB_MDNS_REANNOUNCE_MS) {
+            mdns_last_announce_ms = now_ms;
+            MDNS.announce();
+        }
     }
     if (allow_requests) {
         server.handleClient();

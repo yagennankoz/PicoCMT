@@ -29,6 +29,98 @@ static const uint8_t wifi_icon_8x8[] = {
     0b00011000,  // ...##...
     0b00000000   // ........
 };
+static const int WIFI_ICON_X = 118;  // ファイル一覧の右上 (OLED の 0 ページ目)
+
+// ---------------------------------------------------------------------------
+// Wi-Fi 接続中のアイコンの点滅 (Core1 が描く)
+// WiFi.begin() は接続が終わるまで戻らず、その間 Core0 は画面を描けない。
+// そこで、その間だけ手の空いている Core1 が、アイコンの 8x8 ドットだけを OLED に送って点滅させる。
+// Core0 は WiFi.begin() の前後で begin / end を呼ぶ。end は Core1 が送り終わるのを待つので、
+// 2つのコアが同時に Wire1 (OLED) を使うことはない
+static volatile bool wifi_icon_blink_requested = false;
+static volatile bool wifi_icon_blink_busy = false;
+
+void begin_wifi_icon_blink_on_core1() {
+    // アイコンを出すのはファイル一覧だけ
+    if (current_state != STATE_IDLE || !sd_card_mounted) {
+        return;
+    }
+    __dmb();
+    wifi_icon_blink_requested = true;
+}
+
+void end_wifi_icon_blink_on_core1() {
+    if (!wifi_icon_blink_requested) {
+        return;
+    }
+    wifi_icon_blink_requested = false;
+    __dmb();
+    while (wifi_icon_blink_busy) {
+        tight_loop_contents();
+    }
+    oled_need_refresh = true;  // Core0 の画面バッファで描き直す
+}
+
+// アイコンの部分 (列 WIFI_ICON_X〜+7、0 ページ目) だけを OLED に送る
+static void send_wifi_icon_to_oled(bool on) {
+    uint8_t cols[8];
+    for (int c = 0; c < 8; c++) {
+        uint8_t b = 0;
+        if (on) {
+            for (int r = 0; r < 8; r++) {
+                if ((wifi_icon_8x8[r] >> (7 - c)) & 1) {
+                    b |= (uint8_t)(1u << r);  // 1バイト = 縦8ドット (下位ビットが上)
+                }
+            }
+        }
+        cols[c] = b;
+    }
+    Wire1.beginTransmission(SCREEN_ADDRESS);
+    Wire1.write((uint8_t)0x00);  // 続くのはコマンド
+    Wire1.write((uint8_t)0x21);  // 列の範囲
+    Wire1.write((uint8_t)WIFI_ICON_X);
+    Wire1.write((uint8_t)(WIFI_ICON_X + 7));
+    Wire1.write((uint8_t)0x22);  // ページの範囲
+    Wire1.write((uint8_t)0);
+    Wire1.write((uint8_t)0);
+    Wire1.endTransmission();
+    Wire1.beginTransmission(SCREEN_ADDRESS);
+    Wire1.write((uint8_t)0x40);  // 続くのは表示データ
+    Wire1.write(cols, sizeof(cols));
+    Wire1.endTransmission();
+}
+
+// Core1 の loop1() から、再生・録音していないときに呼ぶ
+void core1_blink_wifi_icon() {
+    static uint32_t last_toggle_ms = 0;
+    static bool icon_on = true;
+
+    if (!wifi_icon_blink_requested) {
+        last_toggle_ms = 0;
+        return;
+    }
+    uint32_t now_ms = millis();
+    if (last_toggle_ms == 0) {
+        // 始めたときは Core0 が描いた画面 (アイコンあり) のまま
+        last_toggle_ms = now_ms;
+        icon_on = true;
+        return;
+    }
+    if ((now_ms - last_toggle_ms) < WIFI_UI_BLINK_INTERVAL_MS) {
+        return;
+    }
+
+    wifi_icon_blink_busy = true;
+    __dmb();
+    // busy を立てた後に確かめ直す (end が先に呼ばれていたら送らない)
+    if (wifi_icon_blink_requested) {
+        last_toggle_ms = now_ms;
+        icon_on = !icon_on;
+        send_wifi_icon_to_oled(icon_on);
+    }
+    __dmb();
+    wifi_icon_blink_busy = false;
+}
 
 // 16x16 Reel Bitmaps (3コマのアニメーションパターン)
 static const uint8_t PROGMEM reel_bmp_0[] = {
@@ -456,7 +548,9 @@ void render_file_browser_to_oled() {
     oled.setTextSize(1);
     oled.setTextColor(SSD1306_WHITE);
 
-    int max_path_len = wifi_connected ? 18 : 21;
+    // 接続中 (つなぎ直しを含む) はアイコンを点滅させる
+    bool show_wifi_icon = wifi_connected || wifi_connect_in_progress;
+    int max_path_len = show_wifi_icon ? 18 : 21;
     String path_str = current_path;
 
     if (path_str.length() > max_path_len) {
@@ -466,8 +560,8 @@ void render_file_browser_to_oled() {
     oled.setCursor(0, 0);
     oled.print(path_str);
 
-    if (wifi_connected) {
-        oled.drawBitmap(118, 0, wifi_icon_8x8, 8, 8, SSD1306_WHITE);
+    if (wifi_connected || (wifi_connect_in_progress && wifi_ui_blink_on)) {
+        oled.drawBitmap(WIFI_ICON_X, 0, wifi_icon_8x8, 8, 8, SSD1306_WHITE);
     }
 
     oled.drawLine(0, 11, 127, 11, SSD1306_WHITE);

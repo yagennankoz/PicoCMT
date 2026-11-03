@@ -4,6 +4,7 @@
 #include "cmt_globals.h"
 #include "cmt_hw_config.h"
 #include "cmt_pins.h"
+#include "cmt_ui.h"
 #include "generated/cmt_play.pio.h"
 #include "generated/cmt_rec.pio.h"
 #include "hardware/pio.h"
@@ -20,6 +21,13 @@ static uint pio_play_program_offset = 0;
 // 録音側ステート管理
 static bool rec_pio_running = false;
 static bool rec_buzzer_enabled = false;
+// 録音で値を取りこぼした回数 (PIO の FIFO があふれた / Core0 へのキューが一杯)
+static volatile uint32_t rec_fifo_overflow_count = 0;
+static volatile uint32_t rec_queue_drop_count = 0;
+// High / Low が交互でなかった回数 (0 でなければ PIO の測定で値が抜けている)
+static volatile uint32_t rec_same_level_count = 0;
+static volatile uint32_t rec_filtered_count = 0;  // 短すぎ・長すぎで捨てた値の数
+static int rec_prev_level = -1;
 
 // ============================================================================
 // 再生(PLAY) 系関数群
@@ -214,16 +222,23 @@ static void init_cmt_rec_pio() {
     pio_gpio_init(pio, BUZZER_PIN);
 
     gpio_set_input_hysteresis_enabled(PICO_IN_PIN, true);
-    hw_set_bits(&pio->input_sync_bypass, 1u << PICO_IN_PIN);
-    hw_set_bits(&pio->input_sync_bypass, 1u << BUZZER_PIN);
+    // 入力の同期回路は通す (バイパスすると、クロックの瞬間に入力が切り替わったとき
+    // jmp pin の飛び先が乱れ、測定中の値が丸ごと消えることがあった。約1us遅れるだけで、
+    // 両方のエッジが同じだけ遅れるのでパルスの長さは変わらない)
+    hw_clear_bits(&pio->input_sync_bypass, 1u << PICO_IN_PIN);
 
     pio_sm_set_consecutive_pindirs(pio, pio_rec_sm, PICO_IN_PIN, 1, false);
     pio_sm_set_consecutive_pindirs(pio, pio_rec_sm, BUZZER_PIN, 1, true);
 
     gpio_set_drive_strength(BUZZER_PIN, GPIO_DRIVE_STRENGTH_8MA);
 
-    float div = 62.5f;  // 125MHz / 62.5 = 2.0MHz
+    // 2MHz 駆動 (1サイクル 0.5us)。システムクロックは 133MHz なので、決め打ちの 62.5
+    // (125MHz 用) では 2.128MHz になり、録音したパルスが約6.4%長く測られていた
+    float div = (float)clock_get_hz(clk_sys) / 2000000.0f;
     sm_config_set_clkdiv(&c, div);
+
+    // 受信 FIFO を8段にして、Core1 の読み出しの遅れに余裕を持たせる
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 
     pio_sm_init(pio, pio_rec_sm, offset, &c);
     pio_sm_set_enabled(pio, pio_rec_sm, false);
@@ -257,6 +272,12 @@ static void start_cmt_rec_pio() {
     while (queue_try_remove(&cmt_data_queue, &dummy));
 
     pio_sm_clear_fifos(pio0, pio_rec_sm);
+    pio0->fdebug = 1u << (PIO_FDEBUG_RXSTALL_LSB + pio_rec_sm);
+    rec_fifo_overflow_count = 0;
+    rec_queue_drop_count = 0;
+    rec_same_level_count = 0;
+    rec_filtered_count = 0;
+    rec_prev_level = -1;
     pio_sm_restart(pio0, pio_rec_sm);
     pio_sm_clkdiv_restart(pio0, pio_rec_sm);
     pio_sm_set_enabled(pio0, pio_rec_sm, true);
@@ -264,9 +285,17 @@ static void start_cmt_rec_pio() {
     rec_pio_running = true;
 }
 
-static void core1_rec_loop() {
+// フラッシュの読み込み待ちで止まらないよう RAM に置く
+static void __not_in_flash_func(core1_rec_loop)() {
     if (!rec_pio_running) {
         return;
+    }
+
+    // FIFO が一杯のときの push noblock は値を捨て、RXSTALL を立てる
+    const uint32_t rxstall_bit = 1u << (PIO_FDEBUG_RXSTALL_LSB + pio_rec_sm);
+    if (pio0->fdebug & rxstall_bit) {
+        pio0->fdebug = rxstall_bit;
+        rec_fifo_overflow_count++;
     }
 
     if (rec_triggered && !rec_buzzer_enabled) {
@@ -281,7 +310,14 @@ static void core1_rec_loop() {
         uint32_t pulse_width_us =
             is_high ? val : ~val;  // 負の数なら反転して時間を取り出す
 
+        int level = is_high ? 1 : 0;
+        if (level == rec_prev_level) {
+            rec_same_level_count++;
+        }
+        rec_prev_level = level;
+
         if (pulse_width_us < 3 || pulse_width_us > 0x00FFFFFF) {
+            rec_filtered_count++;
             continue;
         }
 
@@ -291,9 +327,20 @@ static void core1_rec_loop() {
         }
 
         if (recording_active && recording_permitted && !rec_paused) {
-            queue_try_add(&cmt_data_queue, &queue_val);
+            if (!queue_try_add(&cmt_data_queue, &queue_val)) {
+                rec_queue_drop_count++;
+            }
         }
     }
+}
+
+void log_core1_rec_stats() {
+    Serial.printf(
+        "[REC] dropped: fifo_overflow=%lu queue_full=%lu same_level=%lu filtered=%lu\n",
+        (unsigned long)rec_fifo_overflow_count,
+        (unsigned long)rec_queue_drop_count,
+        (unsigned long)rec_same_level_count,
+        (unsigned long)rec_filtered_count);
 }
 
 // ============================================================================
@@ -342,6 +389,7 @@ void loop1() {
         stop_cmt_rec_pio();
         stop_cmt_play_pio();
         prev_play_active = false;
+        core1_blink_wifi_icon();
         return;
     }
 

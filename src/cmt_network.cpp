@@ -78,11 +78,10 @@ static uint32_t wifi_scan_started_ms = 0;
 static int wifi_join_attempts = 0;
 static uint32_t wifi_last_join_attempt_ms = 0;
 static bool wifi_reconnecting = false;  // 切断後のつなぎ直し中
-static bool wifi_reconnect_pending = false;  // 再生・録音が終わったらつなぎ直す
+static bool wifi_reconnect_pending = false;  // つなぎ直す (再生・録音中は終わってから)
 static bool ntp_start_pending = false;       // 接続できたら NTP で時刻を合わせる
 
-// 再生・録音中か。この間は波形の出力・取り込みを乱さないよう、
-// 時間のかかるWi-Fiの処理 (接続・スキャン・Webのリクエスト) を待たせる
+// 再生・録音中か。この間は Wi-Fi を切り、接続・スキャン・NTP・Webのリクエストを待たせる
 static bool is_tape_busy() {
     return current_state == STATE_PLAYING || current_state == STATE_PLAY_STANDBY ||
            current_state == STATE_RECORDING || current_state == STATE_REC_STANDBY;
@@ -384,7 +383,9 @@ static void start_wifi_join_attempt() {
     WiFi.setTimeout(WIFI_JOIN_ATTEMPT_TIMEOUT_MS);
     // WiFi.begin() は接続(join)が終わるまで戻らないので、その間だけウォッチドッグを延ばす
     watchdog_enable(WIFI_JOIN_WATCHDOG_MS, 0);
+    begin_wifi_icon_blink_on_core1();  // 戻るまでの間は Core1 がアイコンを点滅させる
     WiFi.begin(wifi_ssid, wifi_password);
+    end_wifi_icon_blink_on_core1();
     watchdog_enable(SYSTEM_WATCHDOG_TIMEOUT_MS, 0);
 
     wifi_last_join_attempt_ms = millis();
@@ -397,9 +398,11 @@ static void connect_wifi() {
     wifi_connected = false;
     show_connecting_now();
 
+    begin_wifi_icon_blink_on_core1();
     WiFi.disconnect();
     watchdog_update();
     delay(500);
+    end_wifi_icon_blink_on_core1();
 
     // STA(子機)モードで起動
     WiFi.mode(WIFI_STA);
@@ -441,8 +444,11 @@ static void refresh_wifi_connection_state(bool tape_busy) {
     static int last_status = -1;
     int current_status = WiFi.status();
     if (current_status != last_status) {
-        WIFI_LOG("WiFi Status changed: %s",
-                 get_wifi_status_str(current_status));
+        // link: Wi-Fi チップの状態 (0=DOWN 1=JOIN 2=NOIP 3=UP -1=FAIL -2=NONET -3=BADAUTH)
+        WIFI_LOG("WiFi Status changed: %s (link=%d, t=%lums)",
+                 get_wifi_status_str(current_status),
+                 cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA),
+                 (unsigned long)millis());
         last_status = current_status;
     }
 #endif
@@ -464,8 +470,6 @@ static void refresh_wifi_connection_state(bool tape_busy) {
             oled_need_refresh = true;
             start_web_if_ready();
             ntp_start_pending = true;
-        } else if (tape_busy) {
-            // 再生・録音中は、失敗の判定ややり直し (WiFi.begin() で数秒止まる) を待たせる
         } else if (link == CYW43_LINK_BADAUTH) {
             // パスワード違いは、やり直しても成功しないのですぐにあきらめる
             WIFI_LOG("WiFi authentication failed (wrong password?).");
@@ -488,14 +492,15 @@ static void refresh_wifi_connection_state(bool tape_busy) {
         }
     }
 
-    if (connected_now != wifi_connected) {
+    // 再生・録音のために切った後は読み直さない (切った直後は WL_CONNECTED が残ることがある)。
+    // つなぎ直しは下で行う
+    if (!tape_busy && !wifi_reconnect_pending && connected_now != wifi_connected) {
         wifi_connected = connected_now;
         if (!wifi_connected) {
             WIFI_LOG("WiFi Disconnected unexpectedly.");
             web_server_stop();
 
-            // 接続が意図せず切れた場合は、つなぎ直しを試みる (失敗したらOFFに戻す)。
-            // 再生・録音中なら終わってからつなぎ直す
+            // 接続が意図せず切れた場合は、つなぎ直しを試みる (失敗したらOFFに戻す)
             if (wifi_user_enabled && !wifi_connect_in_progress) {
                 wifi_reconnect_pending = true;
             }
@@ -680,6 +685,19 @@ static void apply_wifi_disconnect_if_requested() {
     oled_need_refresh = true;
 }
 
+// 再生・録音の間だけ Wi-Fi を切る。メニューの ON/OFF は変えず、
+// 終わったら refresh_wifi_connection_state() がつなぎ直す (失敗したら黙って OFF に戻す)
+static void suspend_wifi_for_tape() {
+    WIFI_LOG("Tape busy: WiFi suspended.");
+    web_server_stop();
+    WiFi.disconnect();
+    wifi_connected = false;
+    wifi_connect_in_progress = false;
+    wifi_reconnecting = false;
+    wifi_reconnect_pending = wifi_user_enabled;
+    oled_need_refresh = true;
+}
+
 void init_wifi_and_settings() {
     EEPROM.begin(WIFI_EEPROM_SIZE);
     derive_config_key();
@@ -719,17 +737,12 @@ void init_wifi_and_settings() {
 void handle_wifi_background_tasks() {
     bool tape_busy = is_tape_busy();
 
-    // 再生・録音で待たせていた時間は、接続の制限時間に数えない
-    static bool was_tape_busy = false;
-    static uint32_t tape_busy_since_ms = 0;
-    if (tape_busy && !was_tape_busy) {
-        tape_busy_since_ms = millis();
-    } else if (!tape_busy && was_tape_busy) {
-        uint32_t paused_ms = millis() - tape_busy_since_ms;
-        wifi_connect_started_ms += paused_ms;
-        wifi_last_join_attempt_ms += paused_ms;
+    // 再生・録音の間は Wi-Fi を切り、終わったらつなぎ直す。
+    // Wi-Fi の送信で電源が揺れ、USB ハブなど容量の小さい電源では
+    // 再生の信号が乱れて読み込みエラーになった (実機の PC-8801 で確認)
+    if (tape_busy && (wifi_connected || wifi_connect_in_progress)) {
+        suspend_wifi_for_tape();
     }
-    was_tape_busy = tape_busy;
 
     apply_wifi_settings_if_requested();
     apply_wifi_connect_if_requested();
@@ -744,7 +757,8 @@ void handle_wifi_background_tasks() {
     uint32_t now_ms = millis();
     if ((current_state == STATE_WIFI_CONFIG ||
          current_state == STATE_WEB_PASS_CONFIG ||
-         current_state == STATE_WIFI_MENU) &&
+         current_state == STATE_WIFI_MENU ||
+         (current_state == STATE_IDLE && wifi_connect_in_progress)) &&
         (now_ms - last_blink_ms) >= WIFI_UI_BLINK_INTERVAL_MS) {
         last_blink_ms = now_ms;
         wifi_ui_blink_on = !wifi_ui_blink_on;
@@ -760,7 +774,6 @@ void handle_wifi_background_tasks() {
         clock_start_ntp();
     }
 
-    // 再生・録音中もWi-Fiはつないだままにする。
-    // ただし Webのリクエスト (ダウンロード等は数秒かかる) は処理しない
+    // 再生・録音中は Wi-Fi を切ってあるので、Web サーバーも止まっている
     web_server_handle(!tape_busy);
 }
