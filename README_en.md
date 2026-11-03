@@ -12,13 +12,15 @@ You can also manage the files on the SD card over Wi-Fi from a browser on your P
 * **Playback from files (LOAD)**
   * Supported formats:
 
-    | Extension | Main machines |
-    |---|---|
-    | `.T88` | PC-8801 / PC-8001 (tagged format) |
-    | `.CMT` | PC-8801 / PC-8001 (raw format) |
-    | `.P6` / `.P6T` | PC-6001 |
-    | `.CAS` | MSX |
-    | `.T77` | FM-7 |
+    | Extension | Main machines | Tested on real hardware |
+    |---|---|---|
+    | `.T88` | PC-8801 / PC-8001 (tagged format) | Yes (PC-8801) |
+    | `.CMT` | PC-8801 / PC-8001 (raw format) | Yes (PC-8801) |
+    | `.P6` / `.P6T` | PC-6001 | **Not tested** |
+    | `.CAS` | MSX | Yes |
+    | `.T77` | FM-7 | **Not tested** |
+
+    PC-6001 (`.P6` / `.P6T`) and FM-7 (`.T77`) have not been tested on real hardware or emulators.
   * Converts the data in the file into an FSK audio signal and outputs it to the PC.
   * Starts and pauses playback automatically, following the PC's REMOTE terminal (cassette motor control).
   * T88 files can be cued to the blocks before and after silent sections (blanks).
@@ -115,6 +117,7 @@ It covers the basic UI, the LOAD and SAVE procedures, changing the baud rate, an
 ## Notes and Disclaimer
 
 * The developer accepts no responsibility for any damage caused by connecting or using this device (such as failure of the retro PC or loss of data). Use it at your own risk.
+* PC-6001 (`.P6` / `.P6T`) and FM-7 (`.T77`) have not been tested on real hardware or emulators.
 * **When using Wi-Fi, power the device from a source with enough current, such as an AC adapter (USB charger).** When powered from a PC's USB port or a USB hub, Wi-Fi traffic can make the power supply unstable.
 * Wi-Fi is disconnected automatically during LOAD / SAVE (because Wi-Fi traffic can make the power supply unstable and cause LOAD / SAVE errors on the retro PC; confirmed on a PC-8801).
 * The Web file manager uses unencrypted communication (HTTP). Use it on your home network.
