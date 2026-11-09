@@ -92,6 +92,17 @@ extern bool sd_card_inserted;
 extern bool sd_card_mounted;
 extern bool wifi_connected;
 extern bool wifi_connect_failed;
+// 接続に失敗した理由(エラー画面に出す)
+enum WifiFailReason {
+    WIFI_FAIL_NONE = 0,
+    WIFI_FAIL_BAD_PASSWORD,  // APにパスワードを拒否された
+    WIFI_FAIL_AP_NOT_FOUND,  // APが見つからない
+    WIFI_FAIL_JOIN,          // 接続に失敗した(電波が弱い、APによってはパスワード違いもここ)
+    WIFI_FAIL_NO_IP,         // つながったが、IPアドレスをもらえない(DHCP)
+    WIFI_FAIL_SETTINGS,      // 保存した設定が読めない
+};
+extern WifiFailReason wifi_fail_reason;
+extern int wifi_fail_link_status;  // 失敗したときのWi-Fiチップの状態(link)
 extern bool wifi_connect_in_progress;
 extern uint32_t wifi_connect_started_ms;
 extern bool wifi_settings_saved;
@@ -110,6 +121,16 @@ extern int settings_save_return_cursor;
 extern int wifi_config_field;
 extern int wifi_config_pos;
 extern int wifi_menu_cursor;
+// 設定メニューの行(上からの並び)。WiFiの行はWi-Fi設定が無いときは選べない
+enum SettingsRow {
+    SET_ROW_REC_FMT = 0,
+    SET_ROW_FILTER,
+    SET_ROW_WIFI,
+    SET_ROW_WIFI_CONFIG,
+    SET_ROW_WEB_PASS,
+    SET_ROW_USB,
+    SET_ROW_COUNT
+};
 extern bool wifi_config_apply_requested;
 extern bool wifi_connect_requested;
 extern bool wifi_disconnect_requested;
@@ -124,8 +145,26 @@ extern volatile uint32_t rec_last_sound_time_ms;
 extern volatile uint32_t rec_start_time_ms;
 
 extern RecFormat default_rec_fmt;
+extern FileFilter file_filter;
+
+// フィルタの名前(ALL、T88など)と、ファイル名がフィルタに合うか
+const char* file_filter_name(int filter);
+bool file_matches_filter(const char* name, int filter);
 
 extern int wifi_opt_sel;
+// WiFi Config画面で、保存したWi-Fi設定を消すか確かめている
+extern bool wifi_clear_confirm;
+
+// 変換メニュー:元のファイル、選んでいる形式、結果(0:まだ、1:成功、-1:失敗)、書いたファイル
+extern char convert_src_path[128];
+extern RecFormat convert_fmt;
+extern int convert_result;
+extern char convert_out_path[128];
+
+// 電源を入れた後、PCとつながっているか(USBドライブにするかを聞くか)をまだ決めていない
+extern bool usb_startup_pending;
+// USBドライブの画面で、やめるか確かめている
+extern bool usb_exit_confirm;
 
 extern int cmt_selected_baud_rate;
 extern int cas_selected_baud_rate;

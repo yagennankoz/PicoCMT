@@ -15,4 +15,5 @@ bool save_web_password(const char* password);
 // Webの認証の ON/OFF を保存する
 bool save_web_auth_enabled(bool enabled);
 void save_rec_format_to_eeprom();
+void save_file_filter_to_eeprom();
 void clear_wifi_settings_in_eeprom();

@@ -14,7 +14,9 @@
 #include "cmt_t77_converter.h"
 #include "cmt_t77_format.h"
 #include "cmt_t88_converter.h"
+#include "cmt_wav_converter.h"
 #include "cmt_ui.h"
+#include "hardware/watchdog.h"
 #include "pico/util/queue.h"
 
 #define REC_WRITE_BUF_SIZE 2048
@@ -27,8 +29,6 @@ volatile uint32_t rec_last_sound_time_ms = 0;
 volatile uint32_t rec_start_time_ms = 0;
 volatile bool rec_triggered = false;
 
-static unsigned long silence_start_time_ms = 0;
-static bool rec_is_silence_tracking = false;
 static File raw_rec_file;
 
 static int rec_valid_pulse_count = 0;
@@ -261,14 +261,16 @@ static void append_names_to_target_filename(const String& names) {
 }
 
 /**
- * @brief デフォルトのtarget_filenameを抽出した名前にリネームする
+ * @brief ファイル(path)を抽出した名前にリネームし、pathを新しい名前にする
+ * (同じ名前があれば(1)〜(99)を付ける)
  */
-static void rename_target_filename_with_extracted_names(const String& names) {
+static void rename_file_with_extracted_names(char* path, size_t path_size,
+                                             const String& names) {
     if (names.length() == 0) {
         return;
     }
 
-    String current(target_filename);
+    String current(path);
     int slash_idx = current.lastIndexOf('/');
     String dir = "/";
     if (slash_idx >= 0) {
@@ -294,11 +296,17 @@ static void rename_target_filename_with_extracted_names(const String& names) {
     }
 
     if (current != new_name) {
-        if (SD.rename(target_filename, new_name.c_str())) {
-            snprintf(target_filename, sizeof(target_filename), "%s",
-                     new_name.c_str());
+        if (SD.rename(path, new_name.c_str())) {
+            snprintf(path, path_size, "%s", new_name.c_str());
         }
     }
+}
+
+/**
+ * @brief デフォルトのtarget_filenameを抽出した名前にリネームする
+ */
+static void rename_target_filename_with_extracted_names(const String& names) {
+    rename_file_with_extracted_names(target_filename, sizeof(target_filename), names);
 }
 
 /**
@@ -447,6 +455,72 @@ static bool append_converted_raw_to_file(const char* target_path,
     return success;
 }
 
+// 形式ごとのRAWからの変換関数(RAWはnullptr)
+static std::function<bool(const char*, const char*)> converter_for_format(RecFormat fmt) {
+    switch (fmt) {
+        case FMT_T88:
+            return convert_raw_to_t88;
+        case FMT_CMT:
+        case FMT_P6:
+            return convert_raw_to_cmt;
+        case FMT_CAS:
+            return convert_raw_to_cas;
+        case FMT_T77:
+            return convert_raw_to_t77;
+        case FMT_P6T:
+            return convert_raw_to_p6t;
+        default:
+            return nullptr;
+    }
+}
+
+// 録音したRAWをそのまま別の名前で残す(RAW_TEMP.BINは最後の録音として残す)
+static bool copy_raw_to_file(const char* src_path, const char* dst_path) {
+    File src = SD.open(src_path, FILE_READ);
+    if (!src) {
+        return false;
+    }
+    if (SD.exists(dst_path)) {
+        SD.remove(dst_path);
+    }
+    File dst = SD.open(dst_path, FILE_WRITE);
+    if (!dst) {
+        src.close();
+        return false;
+    }
+    uint32_t total = src.size();
+    uint32_t done = 0;
+    bool ok = true;
+    // 録音が終わって空いている書き込み用のバッファを使う
+    uint8_t* buf = (uint8_t*)rec_sector_buffer;
+    const size_t buf_size = sizeof(rec_sector_buffer);
+    int last_percent = -1;
+    while (ok && done < total) {
+        watchdog_update();
+        int n = src.read(buf, buf_size);
+        if (n <= 0) {
+            ok = false;
+            break;
+        }
+        if (dst.write(buf, n) != (size_t)n) {
+            ok = false;
+            break;
+        }
+        done += n;
+        int percent = (int)((uint64_t)done * 100 / total);
+        if (percent != last_percent) {
+            draw_conversion_progress(percent);
+            last_percent = percent;
+        }
+    }
+    src.close();
+    dst.close();
+    if (!ok) {
+        SD.remove(dst_path);
+    }
+    return ok;
+}
+
 bool start_raw_recording() {
     if (SD.exists(raw_rec_path)) {
         SD.remove(raw_rec_path);
@@ -463,7 +537,6 @@ bool start_raw_recording() {
 
     rec_valid_pulse_count = 0;
     rec_triggered = false;
-    rec_is_silence_tracking = false;
     rec_last_sound_time_ms = millis();
     rec_start_time_ms = 0;
 
@@ -502,14 +575,6 @@ void stop_raw_recording_and_finalize() {
         write_word_to_rec_buffer(ticks_16);
     }
 
-    if (rec_is_silence_tracking) {
-        uint32_t final_silence_ms = millis() - silence_start_time_ms;
-        if (final_silence_ms > 0) {
-            write_word_to_rec_buffer(0xFFFF);
-            write_word_to_rec_buffer((uint16_t)final_silence_ms);
-        }
-    }
-
     flush_rec_buffer();
     if (raw_rec_file) {
         raw_rec_file.close();
@@ -526,31 +591,12 @@ void stop_raw_recording_and_finalize() {
                                                    append_fmt);
         }
     } else {
-        std::function<bool(const char*, const char*)> converter;
-        switch (default_rec_fmt) {
-            case FMT_T88:
-                converter = convert_raw_to_t88;
-                break;
-            case FMT_CMT:
-                converter = convert_raw_to_cmt;
-                break;
-            case FMT_CAS:
-                converter = convert_raw_to_cas;
-                break;
-            case FMT_P6:
-                converter = convert_raw_to_cmt;
-                break;
-            case FMT_T77:
-                converter = convert_raw_to_t77;
-                break;
-            case FMT_P6T:
-                converter = convert_raw_to_p6t;
-                break;
-            default:
-                converter = nullptr;
-                break;
-        }
-        if (converter) {
+        std::function<bool(const char*, const char*)> converter =
+            converter_for_format(default_rec_fmt);
+        if (default_rec_fmt == FMT_RAW) {
+            // 変換せず、録音したままの波形を残す
+            success = copy_raw_to_file(raw_rec_path, target_filename);
+        } else if (converter) {
             success = converter(raw_rec_path, target_filename);
             if (success) {
                 // 新規作成の場合、変換後に抽出とリネームを実行
@@ -624,4 +670,62 @@ void handle_raw_recording_stream() {
             stop_raw_recording_and_finalize();
         }
     }
+}
+
+// ============================================================================
+// RAW/WAVからの変換(ファイル一覧の変換メニュー)
+// ============================================================================
+#define WAV_TEMP_RAW_PATH "/WAV_TEMP.BIN"
+
+bool is_convertible_source(const char* path) {
+    const char* ext = (path != nullptr) ? strrchr(path, '.') : nullptr;
+    return ext != nullptr && (strcasecmp(ext, ".RAW") == 0 || strcasecmp(ext, ".WAV") == 0);
+}
+
+bool convert_file_to_format(const char* src_path, RecFormat fmt, char* out_path,
+                            size_t out_size) {
+    static const char* const ext_list[] = {".T88", ".CMT", ".CAS", ".P6", ".T77", ".P6T", ".RAW"};
+    static_assert(sizeof(ext_list) / sizeof(ext_list[0]) == FMT_MAX, "ext_list");
+    std::function<bool(const char*, const char*)> converter = converter_for_format(fmt);
+    if (!is_convertible_source(src_path) || !converter || out_path == nullptr || out_size == 0) {
+        return false;
+    }
+
+    // 書き出す名前:元のファイルの拡張子を形式のものに替える。あれば_2, _3 ...を付ける
+    String base = String(src_path);
+    int dot = base.lastIndexOf('.');
+    if (dot > 0) {
+        base = base.substring(0, dot);
+    }
+    String candidate = base + ext_list[fmt];
+    for (int i = 2; SD.exists(candidate.c_str()) && i <= 99; i++) {
+        candidate = base + "_" + String(i) + ext_list[fmt];
+    }
+    if (SD.exists(candidate.c_str())) {
+        return false;
+    }
+    snprintf(out_path, out_size, "%s", candidate.c_str());
+
+    const char* ext = strrchr(src_path, '.');
+    bool ok;
+    if (strcasecmp(ext, ".WAV") == 0) {
+        // WAVは一度RAWにしてから変換する
+        ok = convert_wav_to_raw(src_path, WAV_TEMP_RAW_PATH) &&
+             converter(WAV_TEMP_RAW_PATH, out_path);
+        SD.remove(WAV_TEMP_RAW_PATH);
+    } else {
+        ok = converter(src_path, out_path);
+    }
+    if (!ok) {
+        if (SD.exists(out_path)) {
+            SD.remove(out_path);
+        }
+        return false;
+    }
+    // 録音と同じく、テープの中の名前(ヘッダのファイル名)が見つかればその名前にする
+    String extracted = (fmt == FMT_T77) ? names_from_t77_headers() : extract_names_from_file(out_path);
+    if (extracted.length() > 0) {
+        rename_file_with_extracted_names(out_path, out_size, extracted);
+    }
+    return true;
 }

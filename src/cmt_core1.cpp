@@ -21,6 +21,19 @@ static uint pio_play_program_offset = 0;
 // 録音側ステート管理
 static bool rec_pio_running = false;
 static bool rec_buzzer_enabled = false;
+// 録音中のブザーは入力の波をそのまま鳴らす(録音PIOのサイドセット)。テープの信号の周波数
+// (半周期がこの範囲)でない間は止める。ピー音が終わった後、モーターが止まりかけて
+// 低くなっていく音などを鳴らさないため。範囲内の半周期がREC_BUZZER_RESUME_HALVES続いたら鳴らす
+#define REC_BUZZER_MIN_HALF_US 60    // MSXの2400ボー(4800Hz)の半周期約104usより短いもの
+#define REC_BUZZER_MAX_HALF_US 600   // 1200Hzの半周期約417usより十分長いもの
+#define REC_BUZZER_RESUME_HALVES 16
+static int rec_buzzer_good_halves = 0;
+
+static void rec_buzzer_mute() {
+    gpio_set_function(BUZZER_PIN, GPIO_FUNC_SIO);
+    gpio_put(BUZZER_PIN, 0);
+    rec_buzzer_enabled = false;
+}
 // 録音で値を取りこぼした回数 (PIO の FIFO があふれた / Core0 へのキューが一杯)
 static volatile uint32_t rec_fifo_overflow_count = 0;
 static volatile uint32_t rec_queue_drop_count = 0;
@@ -264,9 +277,8 @@ static void start_cmt_rec_pio() {
     }
 
     // 録音スタート直後はブザーの制御権をCPU(SIO)にして、LOW(ミュート)に固定する
-    gpio_set_function(BUZZER_PIN, GPIO_FUNC_SIO);
-    gpio_put(BUZZER_PIN, 0);
-    rec_buzzer_enabled = false;
+    rec_buzzer_mute();
+    rec_buzzer_good_halves = 0;
 
     uint32_t dummy;
     while (queue_try_remove(&cmt_data_queue, &dummy));
@@ -298,7 +310,9 @@ static void __not_in_flash_func(core1_rec_loop)() {
         rec_fifo_overflow_count++;
     }
 
-    if (rec_triggered && !rec_buzzer_enabled) {
+    // 録音が始まり(rec_triggered)、テープの信号が続いているときだけブザーを鳴らす
+    if (rec_triggered && !rec_buzzer_enabled &&
+        rec_buzzer_good_halves >= REC_BUZZER_RESUME_HALVES) {
         pio_gpio_init(pio0, BUZZER_PIN);
         rec_buzzer_enabled = true;
     }
@@ -315,6 +329,17 @@ static void __not_in_flash_func(core1_rec_loop)() {
             rec_same_level_count++;
         }
         rec_prev_level = level;
+
+        if (pulse_width_us >= REC_BUZZER_MIN_HALF_US && pulse_width_us <= REC_BUZZER_MAX_HALF_US) {
+            if (rec_buzzer_good_halves < REC_BUZZER_RESUME_HALVES) {
+                rec_buzzer_good_halves++;
+            }
+        } else {
+            rec_buzzer_good_halves = 0;
+            if (rec_buzzer_enabled) {
+                rec_buzzer_mute();
+            }
+        }
 
         if (pulse_width_us < 3 || pulse_width_us > 0x00FFFFFF) {
             rec_filtered_count++;

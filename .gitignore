@@ -6,5 +6,3 @@ localdocs
 tools/web_mock_sd
 tools/external
 tools/__pycache__
-docs/claude_app
-CLAUDE.md

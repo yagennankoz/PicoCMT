@@ -10,6 +10,8 @@
 #include "cmt_storage.h"
 #include "cmt_storage_record.h"
 #include "cmt_types.h"
+#include "cmt_ui.h"
+#include "cmt_usb_storage.h"
 #include "hardware/watchdog.h"
 
 static const uint button_pins[NUM_BUTTONS] = {
@@ -362,34 +364,59 @@ static void print_ip_url() {
     }
 }
 
+void fix_settings_menu_cursor() {
+    if (wifi_menu_cursor < 0 || wifi_menu_cursor >= SET_ROW_COUNT) {
+        wifi_menu_cursor = SET_ROW_REC_FMT;
+    }
+    // Wi-Fi設定が無いとWiFiの行は選べないので、WiFi Configに移す
+    if (wifi_menu_cursor == SET_ROW_WIFI && !wifi_settings_saved) {
+        wifi_menu_cursor = SET_ROW_WIFI_CONFIG;
+    }
+}
+
+// 設定メニューのrow行目の頭(カーソル)を出す。行の間隔は6行を最下行のIP表示の上に収める
+static void begin_settings_row(int row) {
+    const int row_h = 8;
+    const int y0 = 9;
+    oled.setCursor(0, y0 + row * row_h);
+    oled.print(wifi_menu_cursor == row ? ">" : " ");
+}
+
 void render_wifi_menu_to_oled() {
     oled.clearDisplay();
     oled.setTextSize(1);
     oled.setTextColor(SSD1306_WHITE);
 
-    int min_cursor = wifi_settings_saved ? 0 : 1;
-    if (wifi_menu_cursor < min_cursor) {
-        wifi_menu_cursor = min_cursor;
-    }
+    fix_settings_menu_cursor();
 
     oled.setCursor(0, 0);
     oled.println("--- SETTINGS ---");
 
-    int y0 = 10;
-    oled.setCursor(0, y0);
-    oled.print(wifi_menu_cursor == 0 ? ">" : " ");
+    begin_settings_row(SET_ROW_REC_FMT);
+    oled.print(" Rec Fmt: ");
+    if (default_rec_fmt >= FMT_MAX) {
+        default_rec_fmt = FMT_T88;
+    }
+    oled.println(rec_format_name(default_rec_fmt));
+
+    begin_settings_row(SET_ROW_FILTER);
+    oled.print(" Filter: ");
+    oled.println(file_filter_name(file_filter));
+
+    begin_settings_row(SET_ROW_WIFI);
     oled.print(" WiFi: ");
     if (wifi_settings_saved) {
-        static const char* const opt_names[] = {"CLEAR", "OFF", "ON"};
+        // 1:OFF、2:ON(設定を消すのはWiFi Config画面で行う)
+        static const char* const opt_names[] = {"", "OFF", "ON"};
         // 今の状態と違う値を選んでいる (まだ OK を押していない) ときは、
-        // 値を点滅させて "OK?" を付ける。CLEAR は選んだ時点で未確定
+        // 値を点滅させて"OK?"を付ける
         int current_opt = wifi_user_enabled ? 2 : 1;
         bool pending = (wifi_opt_sel != current_opt);
-        int opt = (wifi_opt_sel >= 0 && wifi_opt_sel <= 2) ? wifi_opt_sel : current_opt;
+        int opt = (wifi_opt_sel >= 1 && wifi_opt_sel <= 2) ? wifi_opt_sel : current_opt;
         if (!pending || wifi_ui_blink_on) {
             oled.print(opt_names[opt]);
         } else {
-            oled.print(opt == 0 ? "     " : (opt == 1 ? "   " : "  "));
+            oled.print(opt == 1 ? "   " : "  ");
         }
         if (pending) {
             oled.print(" OK?");
@@ -399,30 +426,20 @@ void render_wifi_menu_to_oled() {
         oled.println("DISABLED");
     }
 
-    int y1 = 20;
-    oled.setCursor(0, y1);
-    oled.print(wifi_menu_cursor == 1 ? ">" : " ");
+    begin_settings_row(SET_ROW_WIFI_CONFIG);
     oled.println(" WiFi Config");
 
-    int y2 = 30;
-    oled.setCursor(0, y2);
-    oled.print(wifi_menu_cursor == 2 ? ">" : " ");
+    begin_settings_row(SET_ROW_WEB_PASS);
     oled.print(" Web Pass: ");
     oled.println(web_auth_enabled ? "ON" : "OFF");
 
-    int y3 = 40;
-    oled.setCursor(0, y3);
-    oled.print(wifi_menu_cursor == 3 ? ">" : " ");
-    oled.print(" Rec Fmt: ");
-    const char* fmt_names[] = {"T88", "CMT", "CAS", "P6", "T77", "P6T"};
-    static_assert(sizeof(fmt_names) / sizeof(fmt_names[0]) == FMT_MAX, "fmt_names");
-
-    if (default_rec_fmt >= FMT_MAX) {
-        default_rec_fmt = FMT_T88;
+    begin_settings_row(SET_ROW_USB);
+    oled.print(" USB Drive");
+    if (!usb_host_connected()) {
+        oled.print(": no PC");
     }
-    oled.println(fmt_names[default_rec_fmt]);
 
-    oled.setCursor(0, 54);
+    oled.setCursor(0, 57);
     if (wifi_connect_in_progress) {
         if (wifi_ui_blink_on) {
             oled.print("IP: Connecting..");
@@ -551,6 +568,12 @@ void render_file_browser_to_oled() {
     // 接続中 (つなぎ直しを含む) はアイコンを点滅させる
     bool show_wifi_icon = wifi_connected || wifi_connect_in_progress;
     int max_path_len = show_wifi_icon ? 18 : 21;
+    // フィルタ中は、フィルタの名前(例:[T88])をパスの右に出す
+    char filter_label[8] = {0};
+    if (file_filter != FILTER_ALL) {
+        snprintf(filter_label, sizeof(filter_label), "[%s]", file_filter_name(file_filter));
+        max_path_len -= (int)strlen(filter_label);
+    }
     String path_str = current_path;
 
     if (path_str.length() > max_path_len) {
@@ -559,6 +582,11 @@ void render_file_browser_to_oled() {
     }
     oled.setCursor(0, 0);
     oled.print(path_str);
+    if (filter_label[0] != 0) {
+        int right = show_wifi_icon ? WIFI_ICON_X - 2 : 128;
+        oled.setCursor(right - 6 * (int)strlen(filter_label), 0);
+        oled.print(filter_label);
+    }
 
     if (wifi_connected || (wifi_connect_in_progress && wifi_ui_blink_on)) {
         oled.drawBitmap(WIFI_ICON_X, 0, wifi_icon_8x8, 8, 8, SSD1306_WHITE);
@@ -569,6 +597,12 @@ void render_file_browser_to_oled() {
     if (total_items == 0) {
         oled.setCursor(16, 28);
         oled.println("Empty folder");
+        if (file_filter != FILTER_ALL) {
+            oled.setCursor(16, 40);
+            oled.print("(Filter: ");
+            oled.print(file_filter_name(file_filter));
+            oled.print(")");
+        }
         oled.display();
         return;
     }
@@ -655,6 +689,17 @@ void render_wifi_config_to_oled() {
     oled.setCursor(0, 0);
     oled.println("-- WIFI CONFIG --");
 
+    if (wifi_clear_confirm) {
+        oled.setCursor(0, 16);
+        oled.println("Clear saved WiFi");
+        oled.setCursor(0, 26);
+        oled.println("settings (SSID/PASS)?");
+        oled.setCursor(0, 44);
+        oled.print("OK:Clear STOP:Cancel");
+        oled.display();
+        return;
+    }
+
     oled.setCursor(0, 12);
     oled.print("AP:");
     if (wifi_scan_in_progress) {
@@ -701,6 +746,10 @@ void render_wifi_config_to_oled() {
 
     oled.setCursor(0, 40);
     oled.print(wifi_config_field == 0 ? "OK:Select STOP:Back" : "OK:Save STOP:Cancel");
+    if (wifi_config_field == 0 && wifi_settings_saved) {
+        oled.setCursor(0, 48);
+        oled.print("LEFT:Clear saved");
+    }
 
     oled.setCursor(0, 56);
     if (wifi_connected) {
@@ -754,17 +803,155 @@ void render_wifi_connect_error_to_oled() {
     oled.setTextSize(1);
     oled.setTextColor(SSD1306_WHITE);
 
+    // 失敗の理由ごとに、見出しと確かめること(1行21文字)
+    const char* title = "Connect failed";
+    const char* hint1 = "Check SSID/PASS";
+    const char* hint2 = "and retry";
+    switch (wifi_fail_reason) {
+        case WIFI_FAIL_BAD_PASSWORD:
+            title = "Wrong password";
+            hint1 = "AP rejected the PASS";
+            hint2 = "Fix it in WiFi Config";
+            break;
+        case WIFI_FAIL_AP_NOT_FOUND:
+            title = "AP not found";
+            hint1 = "Check SSID / range";
+            hint2 = "(2.4GHz only)";
+            break;
+        case WIFI_FAIL_JOIN:
+            title = "Could not join AP";
+            hint1 = "Weak signal, or PASS";
+            hint2 = "may be wrong";
+            break;
+        case WIFI_FAIL_NO_IP:
+            title = "No IP address";
+            hint1 = "Joined, but DHCP";
+            hint2 = "timed out (router?)";
+            break;
+        case WIFI_FAIL_SETTINGS:
+            title = "Settings unreadable";
+            hint1 = "Set WiFi again in";
+            hint2 = "WiFi Config";
+            break;
+        default:
+            break;
+    }
+
     oled.setCursor(0, 0);
     oled.println("-- WIFI ERROR --");
-    oled.setCursor(0, 16);
-    oled.println("Connect failed");
-    oled.setCursor(0, 28);
-    oled.println("Check SSID/PASS");
-    oled.setCursor(0, 40);
-    oled.println("and retry");
+    oled.setCursor(0, 12);
+    oled.println(title);
+    oled.setCursor(0, 22);
+    oled.println(hint1);
+    oled.setCursor(0, 32);
+    oled.println(hint2);
+    // 接続先と、Wi-Fiチップの状態(調べるとき用)
+    oled.setCursor(0, 44);
+    oled.print("SSID:");
+    // 状態の番号を右端に出すので、SSIDは13文字まで
+    char ssid_short[14];
+    snprintf(ssid_short, sizeof(ssid_short), "%s", wifi_ssid);
+    oled.print(ssid_short);
+    if (wifi_fail_link_status != 0) {
+        oled.setCursor(108, 44);
+        oled.print(wifi_fail_link_status);
+    }
     oled.setCursor(0, 56);
     oled.println("Press OK to return");
 
+    oled.display();
+}
+
+const char* rec_format_name(int fmt) {
+    static const char* const names[] = {"T88", "CMT", "CAS", "P6", "T77", "P6T", "RAW"};
+    static_assert(sizeof(names) / sizeof(names[0]) == FMT_MAX, "names");
+    return (fmt >= 0 && fmt < FMT_MAX) ? names[fmt] : "?";
+}
+
+// パスのファイル名の部分
+static const char* base_name_of(const char* path) {
+    const char* slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+void render_convert_menu_to_oled() {
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setTextWrap(false);
+
+    oled.setCursor(0, 0);
+    oled.println("--- CONVERT ---");
+    draw_marquee_text(0, 12, 21, base_name_of(convert_src_path), true);
+
+    if (convert_result == 0) {
+        oled.setCursor(0, 28);
+        oled.print("To: < ");
+        oled.print(rec_format_name(convert_fmt));
+        oled.print(" >");
+        oled.setCursor(0, 56);
+        oled.print("OK:Convert STOP:Back");
+    } else {
+        oled.setCursor(0, 28);
+        if (convert_result > 0) {
+            oled.print("Done:");
+            draw_marquee_text(30, 28, 16, base_name_of(convert_out_path), true);
+        } else {
+            oled.print("Convert failed");
+        }
+        oled.setCursor(0, 56);
+        oled.print("OK:Back");
+    }
+    oled.display();
+}
+
+void render_usb_prompt_to_oled() {
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setCursor(0, 0);
+    oled.println("--- USB ---");
+    oled.setCursor(0, 14);
+    oled.println("PC connected.");
+    oled.setCursor(0, 26);
+    oled.println("Use the SD card as");
+    oled.setCursor(0, 36);
+    oled.println("a USB drive?");
+    oled.setCursor(0, 56);
+    oled.print("OK:Yes STOP:No");
+    oled.display();
+}
+
+void render_usb_storage_to_oled() {
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setCursor(0, 0);
+    oled.println("--- USB DRIVE ---");
+    if (usb_exit_confirm) {
+        oled.setCursor(0, 14);
+        oled.println("Exit USB drive?");
+        oled.setCursor(0, 26);
+        oled.println("Eject it on the PC");
+        oled.setCursor(0, 36);
+        oled.println("first.");
+        oled.setCursor(0, 56);
+        oled.print("OK:Exit STOP:Back");
+        oled.display();
+        return;
+    }
+    oled.setCursor(0, 14);
+    oled.println("The SD card is shown");
+    oled.setCursor(0, 24);
+    oled.println("to the PC.");
+    oled.setCursor(0, 36);
+    oled.print("R:");
+    oled.print(usb_storage_read_kb());
+    oled.print("KB W:");
+    oled.print(usb_storage_write_kb());
+    oled.print("KB");
+    oled.setCursor(0, 56);
+    oled.print("Eject on PC / STOP");
     oled.display();
 }
 
@@ -793,6 +980,12 @@ void update_oled_display() {
         }
     } else if (current_state == STATE_REC_MENU) {
         render_rec_menu_to_oled();
+    } else if (current_state == STATE_CONVERT_MENU) {
+        render_convert_menu_to_oled();
+    } else if (current_state == STATE_USB_PROMPT) {
+        render_usb_prompt_to_oled();
+    } else if (current_state == STATE_USB_STORAGE) {
+        render_usb_storage_to_oled();
     } else if (current_state == STATE_WIFI_MENU) {
         render_wifi_menu_to_oled();
     } else if (current_state == STATE_WIFI_CONFIG) {

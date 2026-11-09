@@ -16,7 +16,10 @@ typedef enum {
     STATE_WIFI_CONFIG,
     STATE_WEB_PASS_CONFIG,
     STATE_WIFI_SAVE_RESULT,
-    STATE_WIFI_CONNECT_ERROR
+    STATE_WIFI_CONNECT_ERROR,
+    STATE_CONVERT_MENU,  // RAW/WAVを各形式に変換する
+    STATE_USB_PROMPT,    // 電源を入れたときにPCとつながっていた。USBドライブにするか選ぶ
+    STATE_USB_STORAGE    // SDカードをUSBドライブとしてPCに見せている
 } SystemState;
 typedef enum { MODE_NEW, MODE_APPEND } RecMode;
 typedef enum { REMOTE_OFF, REMOTE_ON } RemoteState;
@@ -39,8 +42,23 @@ typedef enum {
     FMT_P6,
     FMT_T77,
     FMT_P6T,  // 設定 (EEPROM) に番号で保存するので、追加は最後にする
+    FMT_RAW,  // 録音したままの波形(変換しない)
     FMT_MAX
 } RecFormat;
+
+// ファイル一覧に出す拡張子(設定に番号で保存するので、追加は最後にする)
+typedef enum {
+    FILTER_ALL = 0,
+    FILTER_T88,
+    FILTER_CMT,
+    FILTER_CAS,
+    FILTER_P6,
+    FILTER_P6T,
+    FILTER_T77,
+    FILTER_RAW,
+    FILTER_WAV,
+    FILTER_MAX
+} FileFilter;
 
 typedef struct {
     char name[MAX_NAME_LEN];

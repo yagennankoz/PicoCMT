@@ -135,6 +135,105 @@ inline std::vector<uint8_t> random_bytes(size_t n, uint32_t seed) {
     return v;
 }
 
+// ----------------------------------------------------------------------------
+// バイトごとにボーレート(600/1200)を切り替えられるPC-8801の信号
+// (1つのブロックの途中でボーレートを変えるテープ)。
+// 作った並びをsegsに残すので、同じ中身のT88も組み立てられる
+// ----------------------------------------------------------------------------
+class MixedTapeSignal {
+   public:
+    struct Seg {
+        enum Kind { MARK, DATA, SILENCE } kind;
+        double ms;                   // MARK/SILENCEの長さ
+        int baud;                    // DATAのボーレート
+        std::vector<uint8_t> bytes;  // DATAの中身
+        bool even_parity = false;    // 8bit・偶数パリティ・ストップビット1か
+    };
+    std::vector<Half> halves;
+    std::vector<Seg> segs;
+
+    MixedTapeSignal(double speed = 1.0, double jitter = 0.0, uint32_t seed = 1)
+        : f1200_(at_speed(FSK_1200, speed)), f600_(at_speed(FSK_600, speed)), jitter_(jitter),
+          rng_(seed) {}
+
+    // even_parity: 8bit・偶数パリティ・ストップビット1(1バイトの長さはストップビット2と同じ)
+    void byte(int baud, uint8_t v, bool even_parity = false) {
+        const FskFormat& f = (baud == 600) ? f600_ : f1200_;
+        bit(f, 0);
+        for (int j = 0; j < 8; j++) {
+            bit(f, (v >> j) & 1);
+        }
+        if (even_parity) {
+            bit(f, __builtin_popcount(v) & 1);
+            bit(f, 1);
+        } else {
+            for (int i = 0; i < f.stop_bits; i++) {
+                bit(f, 1);
+            }
+        }
+        if (segs.empty() || segs.back().kind != Seg::DATA || segs.back().baud != baud ||
+            segs.back().even_parity != even_parity) {
+            segs.push_back({Seg::DATA, 0, baud, {}, even_parity});
+        }
+        segs.back().bytes.push_back(v);
+    }
+    void bytes(int baud, const std::vector<uint8_t>& data, bool even_parity = false) {
+        for (uint8_t v : data) {
+            byte(baud, v, even_parity);
+        }
+    }
+    // 指定時間のマーク(2400Hz)
+    void mark_ms(double ms) {
+        int n = (int)round(ms * 1000.0 / (f1200_.short_half_us * f1200_.halves_one));
+        for (int i = 0; i < n; i++) {
+            bit(f1200_, 1);
+        }
+        segs.push_back({Seg::MARK, ms, 0, {}});
+    }
+    void silence_ms(double ms) {
+        ideal_us_ += ms * 1000.0;
+        halves.push_back({false, ideal_us_ - last_edge_us_});
+        last_edge_us_ = ideal_us_;
+        level_ = true;
+        segs.push_back({Seg::SILENCE, ms, 0, {}});
+    }
+    // 作った並び(バイト,ボーレート)
+    std::vector<std::pair<uint8_t, int>> byte_sequence() const {
+        std::vector<std::pair<uint8_t, int>> out;
+        for (const Seg& g : segs) {
+            for (uint8_t v : g.bytes) {
+                out.push_back({v, g.baud});
+            }
+        }
+        return out;
+    }
+
+   private:
+    void bit(const FskFormat& f, int b) {
+        for (int i = 0; i < f.halves_of(b); i++) {
+            half(f.half_us_of(b));
+        }
+    }
+    void half(double us) {
+        ideal_us_ += us;
+        double edge = ideal_us_;
+        if (jitter_ > 0) {
+            std::uniform_real_distribution<double> dist(-jitter_, jitter_);
+            edge += dist(rng_) * f1200_.short_half_us;
+        }
+        halves.push_back({level_, edge - last_edge_us_});
+        last_edge_us_ = edge;
+        level_ = !level_;
+    }
+
+    FskFormat f1200_, f600_;
+    double jitter_;
+    std::mt19937 rng_;
+    bool level_ = true;
+    double ideal_us_ = 0;
+    double last_edge_us_ = 0;
+};
+
 // N88-BASIC のモニタの W名前 で保存したマシン語のヘッダ: "$$$" + ファイル名6バイト
 // (X88000 で保存した T88 による。データは pc8001_machine_code と同じ形)
 inline std::vector<uint8_t> n88_monitor_header(const char* name6) {

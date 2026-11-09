@@ -4,6 +4,7 @@
 
 #include "cmt_globals.h"
 #include "cmt_hw_config.h"
+#include "cmt_t88_converter.h"
 
 // T88のtick数から再生キューに入れる値(us)を求める (再生PIOの命令オーバーヘッド分を引く)
 static uint16_t t88_ticks_to_us_u16(uint32_t ticks) {
@@ -97,6 +98,7 @@ bool PlayerT88::init(File* f, const char* filename) {
     playback_data_actual_type = 0;
     playback_data_frame_bit_index = -1;
     playback_data_bit_active = false;
+    playback_data_bit_half_bits = 2;
     playback_queue_last_progress_ms = millis();
     playback_true_file_pos = 24;
     playback_current_start_ticks = 0;
@@ -260,26 +262,33 @@ bool PlayerT88::begin_next_data_tag_bit() {
             playback_data_frame_bit_index = 0;
         }
 
+        // 1バイトの形(データビット長・パリティ・ストップビット長)はDATAタグの型で決まる
+        T88Frame frame = t88_frame_from_type(playback_data_actual_type);
         int bit_index = playback_data_frame_bit_index;
         playback_data_frame_bit_index++;
+        playback_data_bit_half_bits = 2;
 
         if (bit_index == 0) {
-            playback_data_bit_value = 0;
+            playback_data_bit_value = 0;  // スタートビット
             return true;
         }
-        if (bit_index >= 1 && bit_index <= 8) {
+        if (bit_index <= frame.data_bits) {
             playback_data_bit_value =
                 (playback_data_current_byte >> (bit_index - 1)) & 0x01;
             return true;
         }
-        if (bit_index == 9 || bit_index == 10) {
-            playback_data_bit_value = 1;
-            if (bit_index == 10) {
-                playback_data_frame_bit_index = -1;
-            }
+        if (frame.parity != 0 && bit_index == frame.data_bits + 1) {
+            uint8_t data = playback_data_current_byte & (uint8_t)((1u << frame.data_bits) - 1);
+            int ones = __builtin_popcount(data) & 1;
+            // 偶数パリティは1の数を偶数に、奇数パリティは奇数にする
+            playback_data_bit_value = (frame.parity == 2) ? ones : (ones ^ 1);
             return true;
         }
+        // ストップビット(1.5ビットもあるので、まとめて1つのビットとして出す)
+        playback_data_bit_value = 1;
+        playback_data_bit_half_bits = (uint8_t)frame.stop_half_bits;
         playback_data_frame_bit_index = -1;
+        return true;
     }
 }
 
@@ -296,7 +305,7 @@ bool PlayerT88::emit_pulses_from_data_tag(queue_t* q) {
             if (!begin_next_data_tag_bit()) {
                 return true;
             }
-            playback_data_bit_ticks_remaining = bit_ticks;
+            playback_data_bit_ticks_remaining = bit_ticks * playback_data_bit_half_bits / 2;
             playback_data_bit_active = true;
         }
 
@@ -637,6 +646,7 @@ bool PlayerT88::seek(int direction, queue_t* q) {
     playback_data_actual_type = 0;
     playback_data_frame_bit_index = -1;
     playback_data_bit_active = false;
+    playback_data_bit_half_bits = 2;
     playback_true_file_pos = target_pos;
     playback_queue_last_progress_ms = millis();
 

@@ -63,6 +63,10 @@ int wifi_opt_sel = 1;
 
 bool wifi_connected = false;
 bool wifi_connect_failed = false;
+WifiFailReason wifi_fail_reason = WIFI_FAIL_NONE;
+int wifi_fail_link_status = 0;
+// 今回の接続で見えた失敗の状態(パスワード違い、APが見つからない、その他の順に優先して残す)
+static int wifi_worst_link = 0;
 bool wifi_connect_in_progress = false;
 uint32_t wifi_connect_started_ms = 0;
 
@@ -82,12 +86,18 @@ static bool wifi_reconnect_pending = false;  // つなぎ直す (再生・録音
 static bool ntp_start_pending = false;       // 接続できたら NTP で時刻を合わせる
 
 // 再生・録音中か。この間は Wi-Fi を切り、接続・スキャン・NTP・Webのリクエストを待たせる
+// Wi-Fiを切っておく状態。再生・録音の間と、USBドライブの間(消費電力のため。
+// 電源を入れてPCとつながっていたときは、USBドライブにするかを決めるまで)。
+// 終わったら設定どおりつなぎ直す
 static bool is_tape_busy() {
     return current_state == STATE_PLAYING || current_state == STATE_PLAY_STANDBY ||
-           current_state == STATE_RECORDING || current_state == STATE_REC_STANDBY;
+           current_state == STATE_RECORDING || current_state == STATE_REC_STANDBY ||
+           current_state == STATE_USB_PROMPT || current_state == STATE_USB_STORAGE ||
+           usb_startup_pending;
 }
 
 RecFormat default_rec_fmt = FMT_T88;
+FileFilter file_filter = FILTER_ALL;
 
 // ============================================================================
 // 設定の保存 (EEPROM)
@@ -133,6 +143,8 @@ typedef struct {
     // 電源を入れたときに Wi-Fi に自動で接続する (前回 ON だった)。
     // 1 のときだけ ON とみなす (消去直後のフラッシュの 0xFF を ON と読まないため)
     uint8_t wifi_auto_connect;
+    // ファイル一覧のフィルタ(FileFilter)。前の版で保存した設定では0か0xFFなので、範囲外はALLにする
+    uint8_t file_filter;
 } SysConfig;
 
 static_assert(sizeof(SysConfig) <= WIFI_EEPROM_SIZE, "SysConfig does not fit in EEPROM");
@@ -236,6 +248,13 @@ void save_rec_format_to_eeprom() {
     SysConfig cfg;
     read_config(cfg);
     cfg.default_rec_fmt = (uint8_t)default_rec_fmt;
+    write_config(cfg);
+}
+
+void save_file_filter_to_eeprom() {
+    SysConfig cfg;
+    read_config(cfg);
+    cfg.file_filter = (uint8_t)file_filter;
     write_config(cfg);
 }
 
@@ -412,12 +431,26 @@ static void connect_wifi() {
     wifi_connect_started_ms = millis();
     wifi_connected = false;
     wifi_join_attempts = 0;
+    wifi_worst_link = 0;
 
     start_wifi_join_attempt();
 }
 
+// 試している間に見えたWi-Fiチップの失敗の状態を覚えておく
+static void note_link_failure(int link) {
+    auto rank = [](int l) {
+        return (l == CYW43_LINK_BADAUTH) ? 3 : (l == CYW43_LINK_NONET) ? 2 : (l < 0) ? 1 : 0;
+    };
+    if (rank(link) > rank(wifi_worst_link)) {
+        wifi_worst_link = link;
+    }
+}
+
 // 接続をあきらめる
-static void fail_wifi_connection() {
+static void fail_wifi_connection(WifiFailReason reason) {
+    wifi_fail_reason = reason;
+    wifi_fail_link_status = wifi_worst_link;
+    WIFI_LOG("WiFi connect failed: reason=%d link=%d", (int)reason, wifi_worst_link);
     wifi_disconnect_requested = true;
     wifi_connect_in_progress = false;
     wifi_connected = false;
@@ -459,6 +492,7 @@ static void refresh_wifi_connection_state(bool tape_busy) {
         uint32_t now_ms = millis();
         bool timed_out = (now_ms - wifi_connect_started_ms) >= WIFI_CONNECT_TIMEOUT_MS;
         int link = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
+        note_link_failure(link);
 
         if (connected_now) {
             WIFI_LOG("WiFi Connection SUCCESS! IP Address: %s",
@@ -473,12 +507,12 @@ static void refresh_wifi_connection_state(bool tape_busy) {
         } else if (link == CYW43_LINK_BADAUTH) {
             // パスワード違いは、やり直しても成功しないのですぐにあきらめる
             WIFI_LOG("WiFi authentication failed (wrong password?).");
-            fail_wifi_connection();
+            fail_wifi_connection(WIFI_FAIL_BAD_PASSWORD);
         } else if (link == CYW43_LINK_JOIN) {
             // APには接続済みで、DHCPでIPアドレスを受け取るのを待っている
             if (timed_out) {
                 WIFI_LOG("WiFi DHCP TIMEOUT. Aborting...");
-                fail_wifi_connection();
+                fail_wifi_connection(WIFI_FAIL_NO_IP);
             }
         } else if ((now_ms - wifi_last_join_attempt_ms) >= WIFI_JOIN_RETRY_INTERVAL_MS) {
             // 接続(join)に失敗している。回数と時間が残っていればやり直す
@@ -487,7 +521,10 @@ static void refresh_wifi_connection_state(bool tape_busy) {
             } else {
                 WIFI_LOG("WiFi Connection failed after %d attempts. Aborting...",
                          wifi_join_attempts);
-                fail_wifi_connection();
+                // 途中で見えた状態から理由を決める
+                fail_wifi_connection((wifi_worst_link == CYW43_LINK_BADAUTH) ? WIFI_FAIL_BAD_PASSWORD
+                                     : (wifi_worst_link == CYW43_LINK_NONET) ? WIFI_FAIL_AP_NOT_FOUND
+                                                                             : WIFI_FAIL_JOIN);
             }
         }
     }
@@ -623,7 +660,7 @@ static void apply_wifi_settings_if_requested() {
     wifi_disconnect_requested = true;
     wifi_save_result_success = save_wifi_settings_to_flash();
     settings_save_result_label = "WiFi settings";
-    settings_save_return_cursor = 0;
+    settings_save_return_cursor = SET_ROW_WIFI;
     wifi_save_result_until_ms = millis() + WIFI_SAVE_STATUS_DISPLAY_MS;
     current_state = STATE_WIFI_SAVE_RESULT;
     reset_and_ignore_pressed_buttons();
@@ -659,6 +696,8 @@ static void apply_wifi_connect_if_requested() {
         wifi_user_enabled = false;
         wifi_opt_sel = 1;
         wifi_connect_failed = true;
+        wifi_fail_reason = WIFI_FAIL_SETTINGS;
+        wifi_fail_link_status = 0;
         current_state = STATE_WIFI_CONNECT_ERROR;
         reset_and_ignore_pressed_buttons();
         oled_need_refresh = true;
@@ -721,6 +760,7 @@ void init_wifi_and_settings() {
     }
 
     default_rec_fmt = (cfg.default_rec_fmt < FMT_MAX) ? (RecFormat)cfg.default_rec_fmt : FMT_T88;
+    file_filter = (cfg.file_filter < FILTER_MAX) ? (FileFilter)cfg.file_filter : FILTER_ALL;
     wifi_settings_saved = load_wifi_settings_from_flash();
     load_web_settings_from_flash();
 

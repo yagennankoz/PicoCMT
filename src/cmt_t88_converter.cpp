@@ -239,6 +239,33 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
     TagType block_type = TAG_TYPE_NONE;
     uint64_t block_start_us = 0;
     uint64_t last_data_end_us = 0;
+    // 1バイトだけのDATAを残すかどうかの材料:そのバイトのストップビットが崩れていないか、
+    // 区間の前がMarkか、区間をMarkで区切って閉じるところか
+    bool single_byte_ok = false;
+    bool data_after_mark = false;
+    bool closing_at_mark = false;
+    // DATAの形(パリティの有無)を決める材料:9ビット目が0だったバイトの数と、
+    // 偶数/奇数パリティとして9ビット目が合わなかったバイトの数
+    uint32_t data_bit9_zero = 0;
+    uint32_t data_even_mismatch = 0;
+    uint32_t data_odd_mismatch = 0;
+
+    // 9ビット目がすべて1ならパリティ無し(ストップビット2)。0のバイトがあって、
+    // 偶数か奇数のパリティとほぼ合っていれば、パリティ付き(ストップビット1)とする。
+    // どちらの形でも1バイトは11ビットなので、時間は同じ
+    auto data_mode = [&]() -> uint16_t {
+        if (data_bit9_zero == 0) {
+            return T88_MODE_8N2;
+        }
+        uint32_t limit = data_payload_count / 16;  // 雑音で崩れたバイトの分
+        if (data_even_mismatch <= limit && data_even_mismatch <= data_odd_mismatch) {
+            return T88_MODE_8E1;
+        }
+        if (data_odd_mismatch <= limit) {
+            return T88_MODE_8O1;
+        }
+        return T88_MODE_8N2;
+    };
 
     auto flush_block = [&](uint64_t end_us) -> bool {
         if (block_type == TAG_TYPE_NONE || end_us <= block_start_us) {
@@ -254,10 +281,20 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
         }
 
         if (block_type == TAG_TYPE_DATA) {
-            uint16_t b_rate = (demod.baud_rate == FskDemodulator::BAUD_1200)
-                                  ? 0x01CC
-                                  : 0x00CC;
-            if (data_payload_count < 2) {
+            bool is_1200 = (demod.baud_rate == FskDemodulator::BAUD_1200);
+            uint16_t b_rate = (is_1200 ? T88_TYPE_1200 : 0) | data_mode();
+            // 1バイトだけのものは雑音とみなす。ただし、前後を長いMarkに挟まれていて形も
+            // 崩れていないバイトは残す(600ボーの1バイトや、その後のチェックサム1バイトを
+            // 長いMarkで挟むテープ)。モーターが止まるときの雑音のように
+            // 無音に接しているものは、これまでどおり捨てる
+            bool keep_single = (data_payload_count == 1) && single_byte_ok &&
+                               data_after_mark && closing_at_mark;
+            // 短いのに、バイト数から見込む長さの2倍を超えて間延びしているものも雑音とみなす
+            // (トレーラーの終わりでモーターが止まりかけ、音が低くなった所がデータに見える)
+            uint32_t byte_ticks = is_1200 ? 44 : 88;
+            bool stretched = (data_payload_count <= T88_NOISE_MAX_BYTES) &&
+                             (len_ticks > 2 * byte_ticks * data_payload_count);
+            if ((data_payload_count < 2 && !keep_single) || stretched) {
                 if (!tag_writer->write_carrier(T88_TAG_MARK, start_ticks,
                                                len_ticks)) {
                     return false;
@@ -270,6 +307,9 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
                 }
             }
             data_payload_count = 0;
+            data_bit9_zero = 0;
+            data_even_mismatch = 0;
+            data_odd_mismatch = 0;
         } else {
             uint16_t tag_id = (block_type == TAG_TYPE_SPACE)   ? T88_TAG_SPACE
                               : (block_type == TAG_TYPE_BLANK) ? T88_TAG_BLANK
@@ -285,8 +325,20 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
     bool write_ok = true;  // SDへの書き込みに失敗したら false
 
     demod.on_byte_decoded = [&](uint8_t byte_val) {
+        if (data_payload_count == 0) {
+            single_byte_ok = demod.last_framing_ok;
+        }
         if (data_payload_count < CONV_MAX_DATA_PAYLOAD) {
             data_payload[data_payload_count++] = byte_val;
+            int even_bit = __builtin_popcount(byte_val) & 1;
+            if (demod.last_bit9 == 0) {
+                data_bit9_zero++;
+            }
+            if (demod.last_bit9 != even_bit) {
+                data_even_mismatch++;
+            } else {
+                data_odd_mismatch++;
+            }
         }
         last_data_end_us = demod.current_time_us;
 
@@ -367,7 +419,10 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
                     uint64_t data_end_us = (last_data_end_us > block_start_us)
                                                ? last_data_end_us
                                                : block_start_us;
-                    if (!flush_block(data_end_us)) {
+                    closing_at_mark = (current_type == TAG_TYPE_MARK);
+                    bool ok = flush_block(data_end_us);
+                    closing_at_mark = false;
+                    if (!ok) {
                         cleanup();
                         return false;
                     }
@@ -387,6 +442,7 @@ bool convert_raw_to_t88(const char* raw_path, const char* t88_path) {
                 uint64_t data_start_us = demod.buffering_baud
                                              ? demod.current_time_us
                                              : demod.window_start_us;
+                data_after_mark = (block_type == TAG_TYPE_MARK);
                 if (!flush_block(data_start_us)) {
                     cleanup();
                     return false;

@@ -20,6 +20,7 @@ class PlayerT88 : public CmtPlayer {
     bool playback_data_bit_active;
     uint8_t playback_data_bit_value;
     uint32_t playback_data_bit_ticks_remaining;
+    uint8_t playback_data_bit_half_bits;  // 出しているビットの長さ(半ビット単位、ふつうは2)
     uint32_t playback_current_start_ticks;
     uint32_t playback_queue_last_progress_ms;
     uint32_t playback_true_file_pos;

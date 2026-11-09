@@ -385,6 +385,343 @@ void test_xcheck_append_input_t88() {
     roundtrip_t88("/M.T88", "pico_append_roundtrip.t88");
 }
 
+// ----------------------------------------------------------------------------
+// 600/1200ボーの混在(1つのブロックの途中でボーレートを変えるローダーの形式)
+// ----------------------------------------------------------------------------
+// データブロックを1つ足す:
+//   [Mark]600ボー: FF x4+名前6文字[Mark 48ms]
+//   1200ボー: blkno lenH lenL addrH addrL、データ、チェックサム(全バイトのXORがFF)
+//   データは256バイトごとに1バイトだけ600ボーで、その前後に約50msのMarkが入る
+static void mixed_block(MixedTapeSignal& s, uint8_t blk, uint16_t addr, uint16_t len,
+                        uint32_t seed) {
+    s.mark_ms(600);
+    s.bytes(600, {0xFF, 0xFF, 0xFF, 0xFF, 'M', 'I', 'X', 'E', 'D', '1'});
+    s.mark_ms(48);
+    std::vector<uint8_t> hdr = {blk, (uint8_t)(len >> 8), (uint8_t)len, (uint8_t)(addr >> 8),
+                                (uint8_t)addr};
+    uint8_t x = 0;
+    for (uint8_t v : hdr) {
+        s.byte(1200, v);
+        x ^= v;
+    }
+    // 600ボーになる位置:ヘッダのXORから1ずつ引いて0になったバイト
+    uint8_t iy = x;
+    std::vector<uint8_t> data = random_bytes(len, seed);
+    // 600ボーのバイトには、波形だけでは1200ボーの1〜2バイトと区別できない値も混ぜる
+    static const uint8_t ambiguous[] = {0xE6, 0xFE, 0xE0, 0x98};
+    int slow = 0;
+    for (uint16_t k = 0; k < len; k++) {
+        iy = (uint8_t)(iy - 1);
+        uint8_t v = data[k];
+        if (iy == 0) {
+            if (slow % 2 == 0) {
+                v = ambiguous[(slow / 2) % 4];
+            }
+            slow++;
+            s.mark_ms(50);
+            s.byte(600, v);
+            s.mark_ms(50);
+        } else {
+            s.byte(1200, v);
+        }
+        x ^= v;
+    }
+    s.byte(1200, (uint8_t)(0xFF ^ x));
+}
+
+// ブロック0は、最後のデータバイトが600ボーで、チェックサムだけがMarkに挟まれる形
+static MixedTapeSignal mixed_tape(double speed, double jitter, uint32_t seed) {
+    MixedTapeSignal s(speed, jitter, seed);
+    s.silence_ms(500);
+    s.mark_ms(2000);
+    mixed_block(s, 0, 0x0100, 0x0123, seed + 1);
+    mixed_block(s, 1, 0x0200, 0x0400, seed + 2);
+    mixed_block(s, 2, 0x0E00, 0x0C00, seed + 3);
+    s.mark_ms(1000);
+    s.silence_ms(500);
+    return s;
+}
+
+// T88のDATAタグの中身を(バイト,ボーレート)の並びにする
+static std::vector<std::pair<uint8_t, int>> data_sequence(const std::vector<T88Tag>& tags) {
+    std::vector<std::pair<uint8_t, int>> out;
+    for (const T88Tag& t : tags) {
+        if (t.id != T88_TAG_DATA) {
+            continue;
+        }
+        int baud = (t.data_type & 0x0100) ? 1200 : 600;
+        for (uint8_t v : t.payload) {
+            out.push_back({v, baud});
+        }
+    }
+    return out;
+}
+
+static void assert_sequence_equal(const std::vector<std::pair<uint8_t, int>>& expected,
+                                  const std::vector<std::pair<uint8_t, int>>& actual,
+                                  const char* what) {
+    size_t n = std::min(expected.size(), actual.size());
+    for (size_t i = 0; i < n; i++) {
+        if (expected[i] != actual[i]) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "%s: index %u expected %02X/%d got %02X/%d", what,
+                     (unsigned)i, expected[i].first, expected[i].second, actual[i].first,
+                     actual[i].second);
+            TEST_FAIL_MESSAGE(msg);
+        }
+    }
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(expected.size(), actual.size(), what);
+}
+
+static void check_convert_mixed(double speed, double jitter, uint32_t seed) {
+    MixedTapeSignal s = mixed_tape(speed, jitter, seed);
+    write_raw(RAW_PATH, s.halves);
+    TEST_ASSERT_TRUE(convert_raw_to_t88(RAW_PATH, T88_PATH));
+    assert_sequence_equal(s.byte_sequence(), data_sequence(parse_t88(SD.get(T88_PATH))),
+                          "mixed baud");
+}
+
+void test_convert_mixed_baud() { check_convert_mixed(1.0, 0.0, 10); }
+// テープが4%遅く、揺らぎもある(実際の録音で約4%遅いものがあった)
+void test_convert_mixed_baud_slow_tape() { check_convert_mixed(0.96, 0.08, 20); }
+
+// MixedTapeSignalの並びからT88を組み立てる(時間は1/4800秒)
+static std::vector<uint8_t> build_t88(const MixedTapeSignal& s) {
+    std::vector<uint8_t> d(T88_SIGNATURE, T88_SIGNATURE + 24);
+    auto u16 = [&](uint32_t v) {
+        d.push_back(v & 0xFF);
+        d.push_back((v >> 8) & 0xFF);
+    };
+    auto u32 = [&](uint32_t v) {
+        u16(v & 0xFFFF);
+        u16(v >> 16);
+    };
+    u16(T88_TAG_VERSION);
+    u16(2);
+    u16(0x0100);
+    uint32_t pos = 0;
+    for (const auto& g : s.segs) {
+        if (g.kind == MixedTapeSignal::Seg::DATA) {
+            uint32_t len = (uint32_t)g.bytes.size() * (g.baud == 600 ? 88 : 44);
+            u16(T88_TAG_DATA);
+            u16(12 + g.bytes.size());
+            u32(pos);
+            u32(len);
+            u16(g.bytes.size());
+            u16((g.baud == 600 ? 0 : T88_TYPE_1200) |
+                (g.even_parity ? T88_MODE_8E1 : T88_MODE_8N2));
+            d.insert(d.end(), g.bytes.begin(), g.bytes.end());
+            pos += len;
+        } else {
+            uint32_t len = (uint32_t)(g.ms * 4.8 + 0.5);
+            u16(g.kind == MixedTapeSignal::Seg::MARK ? T88_TAG_MARK : T88_TAG_BLANK);
+            u16(8);
+            u32(pos);
+            u32(len);
+            pos += len;
+        }
+    }
+    u16(T88_TAG_END);
+    u16(0);
+    return d;
+}
+
+// 波形を「短い/長い半周期の連続」の並びにする。長いMark(40半周期以上)と無音は長さを比べない
+static std::vector<std::pair<int, int>> fsk_runs(const std::vector<Half>& w) {
+    std::vector<std::pair<int, int>> runs;
+    for (const Half& h : w) {
+        if (h.us > 2000) {
+            continue;
+        }
+        int c = (h.us >= 312) ? 1 : 0;
+        if (!runs.empty() && runs.back().first == c) {
+            runs.back().second++;
+        } else {
+            runs.push_back({c, 1});
+        }
+    }
+    std::vector<std::pair<int, int>> out;
+    for (auto r : runs) {
+        if (r.first == 0 && r.second >= 40) {
+            r.second = -1;
+        }
+        if (!out.empty() && r.second == -1 && out.back().second == -1) {
+            continue;
+        }
+        out.push_back(r);
+    }
+    // 最初のデータの直前のMarkから比べる(先頭のリーダーの扱いの違いは見ない)
+    for (size_t i = 0; i < out.size(); i++) {
+        if (out[i].first == 1) {
+            out.erase(out.begin(), out.begin() + (i == 0 ? 0 : i - 1));
+            break;
+        }
+    }
+    return out;
+}
+
+void test_player_mixed_baud() {
+    // 混在のT88を再生すると、DATAタグごとのボーレートで元と同じ波形になる
+    MixedTapeSignal s = mixed_tape(1.0, 0.0, 30);
+    SD.put(T88_PATH, build_t88(s));
+    std::vector<Half> played = play_t88(T88_PATH);
+    std::vector<std::pair<int, int>> expected = fsk_runs(s.halves);
+    std::vector<std::pair<int, int>> actual = fsk_runs(played);
+    size_t n = std::min(expected.size(), actual.size());
+    for (size_t i = 0; i < n; i++) {
+        if (expected[i] != actual[i]) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "played waveform differs at run %u", (unsigned)i);
+            TEST_FAIL_MESSAGE(msg);
+        }
+    }
+    TEST_ASSERT_EQUAL_UINT32(expected.size(), actual.size());
+
+    // 再生→録音→変換で元の並びに戻る
+    write_raw(RAW_PATH, normalize_silence(played));
+    TEST_ASSERT_TRUE(convert_raw_to_t88(RAW_PATH, "/RT.T88"));
+    assert_sequence_equal(s.byte_sequence(), data_sequence(parse_t88(SD.get("/RT.T88"))),
+                          "mixed baud roundtrip");
+}
+
+// パリティ付き(8bit・偶数パリティ・ストップビット1)のデータが混ざったテープ。
+// 標準の形のブロックの後、600ボーの同期信号と1200ボーの本体をパリティ付きで、
+// 間を約50msのMarkで区切る
+static MixedTapeSignal parity_tape(uint32_t seed) {
+    MixedTapeSignal s(1.0, 0.0, seed);
+    s.silence_ms(500);
+    s.mark_ms(2000);
+    s.bytes(1200, random_bytes(200, seed));
+    s.mark_ms(1000);
+    for (int i = 0; i < 3; i++) {
+        s.bytes(600, {0xFF, 0xFF, 0xFF, 0xFF, 'P', 'A', 'R', 'I', 'T', 'Y'}, true);
+        s.mark_ms(50);
+        s.bytes(1200, random_bytes(255, seed + 1 + i), true);
+        s.mark_ms(50);
+        s.byte(600, (uint8_t)(0x00 + i), true);  // 9ビット目(パリティ)が0の1バイト
+        s.mark_ms(50);
+    }
+    s.mark_ms(1000);
+    s.silence_ms(500);
+    return s;
+}
+
+// DATAタグの型の並び(ボーレート+形)
+static std::vector<uint16_t> data_types(const std::vector<T88Tag>& tags) {
+    std::vector<uint16_t> out;
+    for (const T88Tag& t : tags) {
+        if (t.id == T88_TAG_DATA) {
+            out.push_back(t.data_type);
+        }
+    }
+    return out;
+}
+
+// パリティ付きでも、パリティビットがすべて1なら波形はパリティ無しと同じなので標準の型になる
+static std::vector<uint16_t> expected_types(const MixedTapeSignal& s) {
+    std::vector<uint16_t> out;
+    for (const auto& g : s.segs) {
+        if (g.kind == MixedTapeSignal::Seg::DATA) {
+            bool has_zero_bit9 = false;
+            for (uint8_t v : g.bytes) {
+                has_zero_bit9 |= (__builtin_popcount(v) & 1) == 0;
+            }
+            out.push_back((g.baud == 600 ? 0 : T88_TYPE_1200) |
+                          (g.even_parity && has_zero_bit9 ? T88_MODE_8E1 : T88_MODE_8N2));
+        }
+    }
+    return out;
+}
+
+static void assert_types_equal(const std::vector<uint16_t>& expected,
+                               const std::vector<uint16_t>& actual, const char* what) {
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(expected.size(), actual.size(), what);
+    for (size_t i = 0; i < expected.size(); i++) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "%s: DATA %u type", what, (unsigned)i);
+        TEST_ASSERT_EQUAL_HEX16_MESSAGE(expected[i], actual[i], msg);
+    }
+}
+
+void test_convert_even_parity() {
+    // パリティ付きのデータを、600ボーの同期信号も含めて正しいボーレートで読み、
+    // DATAタグの型にパリティ付き(x17C/x07C)を書く
+    MixedTapeSignal s = parity_tape(50);
+    write_raw(RAW_PATH, s.halves);
+    TEST_ASSERT_TRUE(convert_raw_to_t88(RAW_PATH, T88_PATH));
+    std::vector<T88Tag> tags = parse_t88(SD.get(T88_PATH));
+    assert_sequence_equal(s.byte_sequence(), data_sequence(tags), "even parity");
+    assert_types_equal(expected_types(s), data_types(tags), "even parity");
+}
+
+void test_player_even_parity() {
+    // 型がパリティ付きのDATAは、パリティビットとストップビット1つで再生し、元と同じ波形になる
+    MixedTapeSignal s = parity_tape(60);
+    SD.put(T88_PATH, build_t88(s));
+    std::vector<Half> played = play_t88(T88_PATH);
+    std::vector<std::pair<int, int>> expected = fsk_runs(s.halves);
+    std::vector<std::pair<int, int>> actual = fsk_runs(played);
+    size_t n = std::min(expected.size(), actual.size());
+    for (size_t i = 0; i < n; i++) {
+        if (expected[i] != actual[i]) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "played waveform differs at run %u", (unsigned)i);
+            TEST_FAIL_MESSAGE(msg);
+        }
+    }
+    TEST_ASSERT_EQUAL_UINT32(expected.size(), actual.size());
+
+    // 再生→録音→変換で元のバイトと型に戻る
+    write_raw(RAW_PATH, normalize_silence(played));
+    TEST_ASSERT_TRUE(convert_raw_to_t88(RAW_PATH, "/RT.T88"));
+    std::vector<T88Tag> tags = parse_t88(SD.get("/RT.T88"));
+    assert_sequence_equal(s.byte_sequence(), data_sequence(tags), "even parity roundtrip");
+    assert_types_equal(expected_types(s), data_types(tags), "even parity roundtrip");
+}
+
+void test_t88_frame_from_type() {
+    T88Frame f = t88_frame_from_type(0x01CC);
+    TEST_ASSERT_EQUAL_INT(8, f.data_bits);
+    TEST_ASSERT_EQUAL_INT(0, f.parity);
+    TEST_ASSERT_EQUAL_INT(4, f.stop_half_bits);
+    f = t88_frame_from_type(0x007C);
+    TEST_ASSERT_EQUAL_INT(8, f.data_bits);
+    TEST_ASSERT_EQUAL_INT(2, f.parity);
+    TEST_ASSERT_EQUAL_INT(2, f.stop_half_bits);
+    f = t88_frame_from_type(0x015C);
+    TEST_ASSERT_EQUAL_INT(1, f.parity);
+    f = t88_frame_from_type(0x0188);  // 7bit・パリティ無し・ストップビット1.5
+    TEST_ASSERT_EQUAL_INT(7, f.data_bits);
+    TEST_ASSERT_EQUAL_INT(3, f.stop_half_bits);
+    // 下位バイトが0のもの、ストップビット長が00のものは標準の形
+    f = t88_frame_from_type(0x0100);
+    TEST_ASSERT_EQUAL_INT(8, f.data_bits);
+    TEST_ASSERT_EQUAL_INT(0, f.parity);
+    TEST_ASSERT_EQUAL_INT(4, f.stop_half_bits);
+    f = t88_frame_from_type(0x003C);
+    TEST_ASSERT_EQUAL_INT(0, f.parity);
+    TEST_ASSERT_EQUAL_INT(4, f.stop_half_bits);
+}
+
+void test_convert_drops_stretched_noise_after_trailer() {
+    // トレーラー(長いMark)の終わりでモーターが止まりかけ、音が低くなった所がデータに見える。
+    // バイト数のわりに間延びした短いDATAは雑音としてMARKにする
+    std::vector<uint8_t> data = random_bytes(100, 41);
+    TapeSignal s(FSK_1200, 0.0, 3);
+    s.leader_ms(1000);
+    s.bytes(data);
+    s.leader_ms(1600);
+    // 2バイトで約48ms (見込みの約18msの2倍を超える)
+    s.bytes({0x00});
+    s.leader_ms(30);
+    s.bytes({0xFE});
+    s.leader_ms(100);
+    s.silence(500);
+    write_raw(RAW_PATH, s.halves);
+    TEST_ASSERT_TRUE(convert_raw_to_t88(RAW_PATH, T88_PATH));
+    assert_bytes_equal(data, data_bytes(parse_t88(SD.get(T88_PATH))), "data only");
+}
+
 void setUp() {
     SD.clear();
     mock_millis_value = 0;
@@ -409,5 +746,12 @@ int main(int, char**) {
     RUN_TEST(test_convert_n88_monitor_named);
     RUN_TEST(test_xcheck_roundtrip_input_t88);
     RUN_TEST(test_xcheck_append_input_t88);
+    RUN_TEST(test_convert_mixed_baud);
+    RUN_TEST(test_convert_mixed_baud_slow_tape);
+    RUN_TEST(test_player_mixed_baud);
+    RUN_TEST(test_convert_even_parity);
+    RUN_TEST(test_player_even_parity);
+    RUN_TEST(test_t88_frame_from_type);
+    RUN_TEST(test_convert_drops_stretched_noise_after_trailer);
     return UNITY_END();
 }

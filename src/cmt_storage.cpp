@@ -16,6 +16,7 @@
 #include "player_p6t.h"
 #include "player_t77.h"
 #include "player_t88.h"
+#include "player_wave.h"
 
 CmtPlayer* active_player = nullptr;
 
@@ -195,6 +196,11 @@ bool start_playback_file(const char* filename) {
                    strcasecmp(ext, ".P6") == 0) {
             active_player = new PlayerCMT();
             ((PlayerCMT*)active_player)->set_baud_rate(cmt_selected_baud_rate);
+        } else if (strcasecmp(ext, ".RAW") == 0) {
+            // 録音したままの波形
+            active_player = new PlayerRaw();
+        } else if (strcasecmp(ext, ".WAV") == 0) {
+            active_player = new PlayerWav();
         }
     }
 
@@ -253,6 +259,21 @@ void monitor_playback_finalize() {
     }
 }
 
+const char* file_filter_name(int filter) {
+    static const char* const names[] = {"ALL", "T88", "CMT", "CAS", "P6",
+                                        "P6T", "T77", "RAW", "WAV"};
+    static_assert(sizeof(names) / sizeof(names[0]) == FILTER_MAX, "names");
+    return (filter >= 0 && filter < FILTER_MAX) ? names[filter] : "ALL";
+}
+
+bool file_matches_filter(const char* name, int filter) {
+    if (filter <= FILTER_ALL || filter >= FILTER_MAX) {
+        return true;
+    }
+    const char* ext = strrchr(name, '.');
+    return ext != nullptr && strcasecmp(ext + 1, file_filter_name(filter)) == 0;
+}
+
 bool load_directory(const String& path) {
     total_items = 0;
 
@@ -285,7 +306,13 @@ bool load_directory(const String& path) {
             if (!ext ||
                 (strcasecmp(ext, ".T88") != 0 && strcasecmp(ext, ".CAS") != 0 &&
                  strcasecmp(ext, ".T77") != 0 && strcasecmp(ext, ".CMT") != 0 &&
-                 strcasecmp(ext, ".P6") != 0 && strcasecmp(ext, ".P6T") != 0)) {
+                 strcasecmp(ext, ".P6") != 0 && strcasecmp(ext, ".P6T") != 0 &&
+                 strcasecmp(ext, ".RAW") != 0 && strcasecmp(ext, ".WAV") != 0)) {
+                entry.close();
+                continue;
+            }
+            // 設定のフィルタ(拡張子)に合わないファイルは出さない。フォルダはいつも出す
+            if (!file_matches_filter(fname, file_filter)) {
                 entry.close();
                 continue;
             }

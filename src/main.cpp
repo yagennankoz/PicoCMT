@@ -19,6 +19,7 @@
 #include "cmt_types.h"
 #include "cmt_ui.h"
 #include "cmt_ui_input.h"
+#include "cmt_usb_storage.h"
 #include "hardware/watchdog.h"
 #include "pico/util/queue.h"
 
@@ -190,6 +191,9 @@ static void monitor_sd_card_hotplug() {
 
     if (sd_card_mounted) {
         if (!detect_pin_inserted) {
+            // USBドライブの間にSDが抜かれたら、PCにも抜かれたことを知らせる
+            usb_storage_stop();
+            usb_exit_confirm = false;
             SD.end();
             sd_card_mounted = false;
             sd_card_inserted = false;
@@ -227,6 +231,9 @@ static void monitor_sd_card_hotplug() {
 }
 
 void setup() {
+    // USBにマスストレージを登録する(PCに認識される前に行う)
+    usb_storage_init();
+
     Serial.begin(115200);
     unsigned long start = millis();
     while (!Serial && (millis() - start < 3000)) {
@@ -312,6 +319,13 @@ void loop() {
         last_playback_oled_refresh_ms = 0;
     }
 
+    // USBドライブの間は、読み書きした量の表示を更新する
+    static uint32_t last_usb_oled_refresh_ms = 0;
+    if (current_state == STATE_USB_STORAGE && (now_ms - last_usb_oled_refresh_ms) >= 500) {
+        last_usb_oled_refresh_ms = now_ms;
+        oled_need_refresh = true;
+    }
+
     static uint32_t last_rec_oled_refresh_ms = 0;
     if (current_state == STATE_RECORDING) {
         if ((now_ms - last_rec_oled_refresh_ms) >= 250) {
@@ -332,6 +346,7 @@ void loop() {
     }
 
     scan_ui_buttons();
+    check_usb_at_startup();
     scan_remote_hardware();
     monitor_sd_card_hotplug();
     refresh_directory_if_idle();
@@ -364,6 +379,15 @@ void loop() {
             break;
         case STATE_WIFI_CONNECT_ERROR:
             handle_wifi_connect_error_input();
+            break;
+        case STATE_CONVERT_MENU:
+            handle_convert_menu_input();
+            break;
+        case STATE_USB_PROMPT:
+            handle_usb_prompt_input();
+            break;
+        case STATE_USB_STORAGE:
+            handle_usb_storage_input();
             break;
         case STATE_REC_STANDBY:
         case STATE_PLAY_STANDBY:

@@ -6,7 +6,7 @@
 
 PicoCmt is a cassette tape (CMT) emulator for 8-bit retro PCs, built on the Raspberry Pi Pico W.
 It plays tape image files stored on an SD card to the computer as audio signals (LOAD), and records the audio that the computer outputs when saving, converting it into a tape image file (SAVE).
-You can also manage the files on the SD card over Wi-Fi from a browser on your PC or smartphone.
+You can also manage the files on the SD card over Wi-Fi from a browser on your PC or smartphone, or read and write the SD card as a USB drive from a PC connected by USB.
 
 ## Features
 * **Playback from files (LOAD)**
@@ -19,16 +19,26 @@ You can also manage the files on the SD card over Wi-Fi from a browser on your P
     | `.P6` / `.P6T` | PC-6001 | **Not tested** |
     | `.CAS` | MSX | Yes |
     | `.T77` | FM-7 | **Not tested** |
+    | `.RAW` | Any machine (the recorded waveform as is; a PicoCmt-specific format) | Yes (PC-8801) |
+    | `.WAV` | Any machine (a WAV file recorded from a tape; linear PCM) | Yes (PC-8801) |
 
     PC-6001 (`.P6` / `.P6T`) and FM-7 (`.T77`) have not been tested on real hardware or emulators.
+    Compressed audio such as MP3 is not supported.
+    WAV files are played back with their waveform as is, so a poorly recorded WAV may fail to load. In that case, convert it to T88 or another format first (the converted file is played back with a clean waveform).
   * Converts the data in the file into an FSK audio signal and outputs it to the PC.
   * Starts and pauses playback automatically, following the PC's REMOTE terminal (cassette motor control).
   * T88 files can be cued to the blocks before and after silent sections (blanks).
+  * T88 data is output in the byte format given by each DATA tag (baud rate, parity, and stop bit length).
+  * The file list can be filtered by extension.
 * **Recording and conversion from the real machine (SAVE)**
   * Records the audio output by the PC and automatically converts it into one of the formats above, saving it to the SD card.
   * The baud rate (600 / 1200 / 2400) is detected automatically from the recorded signal.
   * Reads the program name contained in the recorded data and uses it as the file name.
   * Supports appending a recording to an existing file (`.T88` / `.T77` / `.CAS` / `.P6T`).
+  * Tapes that switch between 600 and 1200 baud within a block, and data with parity, can also be recorded to `.T88`.
+  * The recorded waveform can also be saved as is, without conversion, as a `.RAW` file. See [RAW_FORMAT_en.md](RAW_FORMAT_en.md) for the format.
+* **Conversion from RAW / WAV**
+  * `.RAW` and `.WAV` files can be converted on the device into any of the formats above. The file is named after the program name found in the data.
 * **Wi-Fi / Web file manager**
   * Uses the Wi-Fi of the Pico W to run a built-in web server.
   * Without removing the SD card, open `http://picocmt.local/` in a browser on your PC or smartphone to upload, download, delete and rename files, and create folders.
@@ -39,6 +49,10 @@ You can also manage the files on the SD card over Wi-Fi from a browser on your P
   * **When using Wi-Fi, power the device from a source with enough current, such as an AC adapter (USB charger).** Wi-Fi traffic draws a large current, so operation can become unstable when powered from a PC's USB port or a USB hub.
   * The Wi-Fi password and other settings are encrypted with an ID unique to the board and stored in EEPROM.
     However, someone who obtains the device may be able to extract them from the flash memory. If this concerns you, use a guest or IoT Wi-Fi network.
+* **USB drive**
+  * When connected to a PC by USB, the SD card can be read and written as a USB drive on the PC (you can copy and delete files without removing the SD card).
+  * If the device is connected to a PC at power-on, it first asks whether to start the USB drive. You can also start it from the settings menu.
+  * While the USB drive is on, playback, recording, and the file browser stop, and Wi-Fi is disconnected, so that the SD card is not corrupted. Eject the drive on the PC or press [STOP] on the device to return.
 
 ---
 
@@ -110,7 +124,7 @@ When uploading, specify a single environment. Example: `pio run -e rpipico_jp -t
 ## Usage
 
 For operating instructions, see the **[User Manual](MANUAL_en.md)**.
-It covers the basic UI, the LOAD and SAVE procedures, changing the baud rate, and setting up Wi-Fi and the Web file manager.
+It covers the basic UI, the LOAD and SAVE procedures, changing the baud rate, and setting up Wi-Fi and the Web file manager, and using the USB drive.
 
 ---
 
@@ -121,4 +135,5 @@ It covers the basic UI, the LOAD and SAVE procedures, changing the baud rate, an
 * **When using Wi-Fi, power the device from a source with enough current, such as an AC adapter (USB charger).** When powered from a PC's USB port or a USB hub, Wi-Fi traffic can make the power supply unstable.
 * Wi-Fi is disconnected automatically during LOAD / SAVE (because Wi-Fi traffic can make the power supply unstable and cause LOAD / SAVE errors on the retro PC; confirmed on a PC-8801).
 * The Web file manager uses unencrypted communication (HTTP). Use it on your home network.
-* When you give away or dispose of the device, erase the saved Wi-Fi settings with `WiFi: CLEAR` in the settings menu.
+* When you give away or dispose of the device, erase the saved Wi-Fi settings with `WiFi Config` in the settings menu ([LEFT] on the access point selection screen).
+* While the USB drive is on, unplugging the USB cable or removing the SD card without ejecting the drive on the PC first can corrupt files being written.

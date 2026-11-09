@@ -13,6 +13,7 @@
 #include "cmt_storage_record.h"
 #include "cmt_types.h"
 #include "cmt_ui.h"
+#include "cmt_usb_storage.h"
 #include "pico/util/queue.h"
 
 extern bool start_playback_file(const char* filename);
@@ -32,6 +33,18 @@ static_assert(sizeof(WIFI_CHARSET) - 1 == 0x7E - 0x20 + 1, "WIFI_CHARSET must co
 
 static uint32_t wifi_edit_last_repeat_ms[NUM_BUTTONS] = {0};
 static bool wifi_menu_wait_stop_release = false;
+bool wifi_clear_confirm = false;
+
+char convert_src_path[128] = {0};
+RecFormat convert_fmt = FMT_T88;
+int convert_result = 0;
+char convert_out_path[128] = {0};
+
+bool usb_startup_pending = true;
+bool usb_exit_confirm = false;
+
+// ファイル一覧でRAW/WAVの上でOKを押し、離すか長押しになるのを待っている
+static bool ok_hold_pending = false;
 
 // Webパスワード入力画面で編集中のパスワード
 char web_password_edit[WEB_PASSWORD_MAX_LEN + 1] = {0};
@@ -157,8 +170,9 @@ static bool edit_text_buffer(char* buf, int max_len) {
 }
 
 // 設定メニューの Rec Fmt で選ぶ順番。RecFormat の番号は設定 (EEPROM) に保存しているので変えず、
-// 見せる順番だけをここで決める (機種ごとにまとめる: PC-8801 → MSX → PC-6001 → FM-7)
-static const RecFormat REC_FMT_MENU_ORDER[] = {FMT_T88, FMT_CMT, FMT_CAS, FMT_P6, FMT_P6T, FMT_T77};
+// 見せる順番だけをここで決める(機種ごとにまとめる: PC-8801 → MSX → PC-6001 → FM-7、最後に変換しないRAW)
+static const RecFormat REC_FMT_MENU_ORDER[] = {FMT_T88, FMT_CMT, FMT_CAS, FMT_P6, FMT_P6T, FMT_T77,
+                                               FMT_RAW};
 static_assert(sizeof(REC_FMT_MENU_ORDER) / sizeof(REC_FMT_MENU_ORDER[0]) == FMT_MAX,
               "REC_FMT_MENU_ORDER");
 
@@ -177,7 +191,7 @@ static RecFormat step_rec_format(RecFormat current, int dir) {
 
 static void build_default_record_filename() {
     char candidate[sizeof(target_filename)] = {0};
-    const char* ext_list[] = {".T88", ".CMT", ".CAS", ".P6", ".T77", ".P6T"};
+    const char* ext_list[] = {".T88", ".CMT", ".CAS", ".P6", ".T77", ".P6T", ".RAW"};
     static_assert(sizeof(ext_list) / sizeof(ext_list[0]) == FMT_MAX, "ext_list");
 
     if (default_rec_fmt >= FMT_MAX) {
@@ -207,9 +221,60 @@ static void build_default_record_filename() {
     }
 }
 
+// 選んでいるファイルを再生する(再生待ちの画面へ)
+static void start_selected_file_playback() {
+    char selected_path[MAX_NAME_LEN] = {0};
+    build_selected_item_abs_path(selected_path, sizeof(selected_path),
+                                 file_list[current_cursor].name);
+    if (start_playback_file(selected_path)) {
+        current_state = STATE_PLAY_STANDBY;
+        reset_and_ignore_pressed_buttons();
+        update_system_run_permissions();
+        oled_need_refresh = true;
+    }
+}
+
+// 変換メニューで選ぶ形式の順番(録音のRec Fmtと同じ並びからRAWを除いたもの)
+static RecFormat step_convert_format(RecFormat current, int dir) {
+    RecFormat f = current;
+    do {
+        f = step_rec_format(f, dir);
+    } while (f == FMT_RAW);
+    return f;
+}
+
+static void open_convert_menu() {
+    build_selected_item_abs_path(convert_src_path, sizeof(convert_src_path),
+                                 file_list[current_cursor].name);
+    convert_fmt = (default_rec_fmt == FMT_RAW) ? FMT_T88 : default_rec_fmt;
+    convert_result = 0;
+    convert_out_path[0] = 0;
+    current_state = STATE_CONVERT_MENU;
+    reset_and_ignore_pressed_buttons();
+    oled_need_refresh = true;
+}
+
 void handle_file_browser_input() {
     if (current_state == STATE_PLAY_STANDBY || play_active) {
         return;
+    }
+
+    // RAW/WAVの上でOKを押したら、1秒押し続ければ変換メニュー、すぐ離せば再生
+    if (ok_hold_pending) {
+        if (total_items == 0 || file_list[current_cursor].is_dir) {
+            ok_hold_pending = false;
+        } else if (btn_trigger_repeat[IDX_OK]) {
+            btn_trigger_repeat[IDX_OK] = false;
+            ok_hold_pending = false;
+            open_convert_menu();
+            return;
+        } else if (!buttons[IDX_OK].current_stable_state) {
+            ok_hold_pending = false;
+            start_selected_file_playback();
+            return;
+        } else {
+            return;  // 押している間は他のボタンを見ない
+        }
     }
 
     bool is_cmt_selected = false;
@@ -251,8 +316,8 @@ void handle_file_browser_input() {
 
     if (btn_trigger_repeat[IDX_STOP]) {
         btn_trigger_repeat[IDX_STOP] = false;
-        wifi_menu_cursor = wifi_settings_saved ? 0 : 1;
-        // 0:CLEAR, 1:OFF, 2:ON
+        wifi_menu_cursor = SET_ROW_REC_FMT;
+        // 1:OFF, 2:ON
         wifi_opt_sel = wifi_user_enabled ? 2 : 1;
         wifi_menu_wait_stop_release = true;
         current_state = STATE_WIFI_MENU;
@@ -334,16 +399,12 @@ void handle_file_browser_input() {
                     load_directory(current_path);
                     oled_need_refresh = true;
                 }
+            } else if (is_ok_requested && is_convertible_source(selected.name) &&
+                       buttons[IDX_OK].current_stable_state) {
+                // 離すか長押しになるまで待つ(上のok_hold_pending)
+                ok_hold_pending = true;
             } else {
-                char selected_path[MAX_NAME_LEN] = {0};
-                build_selected_item_abs_path(
-                    selected_path, sizeof(selected_path), selected.name);
-                if (start_playback_file(selected_path)) {
-                    current_state = STATE_PLAY_STANDBY;
-                    reset_and_ignore_pressed_buttons();
-                    update_system_run_permissions();
-                    oled_need_refresh = true;
-                }
+                start_selected_file_playback();
             }
         }
     }
@@ -446,15 +507,7 @@ void handle_wifi_menu_input() {
         wifi_menu_wait_stop_release = false;
     }
 
-    int min_cursor = wifi_settings_saved ? 0 : 1;
-    int max_cursor = 3;
-
-    if (wifi_menu_cursor < min_cursor) {
-        wifi_menu_cursor = min_cursor;
-    }
-    if (wifi_menu_cursor > max_cursor) {
-        wifi_menu_cursor = max_cursor;
-    }
+    fix_settings_menu_cursor();
 
     if (btn_trigger_clicked[IDX_STOP] || btn_trigger_clicked[IDX_CANCEL]) {
         btn_trigger_clicked[IDX_STOP] = false;
@@ -467,25 +520,33 @@ void handle_wifi_menu_input() {
 
     if (btn_trigger_clicked[IDX_UP]) {
         btn_trigger_clicked[IDX_UP] = false;
-        if (wifi_menu_cursor > min_cursor) {
-            wifi_menu_cursor--;
+        int c = wifi_menu_cursor - 1;
+        if (c == SET_ROW_WIFI && !wifi_settings_saved) {
+            c--;
+        }
+        if (c >= 0) {
+            wifi_menu_cursor = c;
             oled_need_refresh = true;
         }
     }
 
     if (btn_trigger_clicked[IDX_DOWN]) {
         btn_trigger_clicked[IDX_DOWN] = false;
-        if (wifi_menu_cursor < max_cursor) {
-            wifi_menu_cursor++;
+        int c = wifi_menu_cursor + 1;
+        if (c == SET_ROW_WIFI && !wifi_settings_saved) {
+            c++;
+        }
+        if (c < SET_ROW_COUNT) {
+            wifi_menu_cursor = c;
             oled_need_refresh = true;
         }
     }
 
-    if (wifi_menu_cursor == 0) {
+    if (wifi_menu_cursor == SET_ROW_WIFI) {
         if (btn_trigger_clicked[IDX_LEFT] || btn_trigger_repeat[IDX_LEFT]) {
             btn_trigger_clicked[IDX_LEFT] = false;
             btn_trigger_repeat[IDX_LEFT] = false;
-            if (wifi_opt_sel > 0) {
+            if (wifi_opt_sel > 1) {
                 wifi_opt_sel--;
             }
             oled_need_refresh = true;
@@ -498,7 +559,7 @@ void handle_wifi_menu_input() {
             }
             oled_need_refresh = true;
         }
-    } else if (wifi_menu_cursor == 2) {
+    } else if (wifi_menu_cursor == SET_ROW_WEB_PASS) {
         // Web の認証の ON/OFF (その場で保存する)
         if (btn_trigger_clicked[IDX_LEFT] || btn_trigger_clicked[IDX_RIGHT]) {
             bool enable = btn_trigger_clicked[IDX_RIGHT];
@@ -511,7 +572,7 @@ void handle_wifi_menu_input() {
         }
         btn_trigger_repeat[IDX_LEFT] = false;
         btn_trigger_repeat[IDX_RIGHT] = false;
-    } else if (wifi_menu_cursor == 3) {
+    } else if (wifi_menu_cursor == SET_ROW_REC_FMT) {
         if (btn_trigger_clicked[IDX_LEFT] || btn_trigger_repeat[IDX_LEFT]) {
             btn_trigger_clicked[IDX_LEFT] = false;
             btn_trigger_repeat[IDX_LEFT] = false;
@@ -526,9 +587,30 @@ void handle_wifi_menu_input() {
             save_rec_format_to_eeprom();
             oled_need_refresh = true;
         }
+    } else if (wifi_menu_cursor == SET_ROW_FILTER) {
+        // ファイル一覧のフィルタ。変えたら一覧を読み直す
+        int dir = 0;
+        if (btn_trigger_clicked[IDX_LEFT] || btn_trigger_repeat[IDX_LEFT]) {
+            btn_trigger_clicked[IDX_LEFT] = false;
+            btn_trigger_repeat[IDX_LEFT] = false;
+            dir = -1;
+        }
+        if (btn_trigger_clicked[IDX_RIGHT] || btn_trigger_repeat[IDX_RIGHT]) {
+            btn_trigger_clicked[IDX_RIGHT] = false;
+            btn_trigger_repeat[IDX_RIGHT] = false;
+            dir = +1;
+        }
+        if (dir != 0) {
+            file_filter = (FileFilter)((file_filter + dir + FILTER_MAX) % FILTER_MAX);
+            save_file_filter_to_eeprom();
+            current_cursor = 0;
+            scroll_offset = 0;
+            load_directory(current_path);
+            oled_need_refresh = true;
+        }
     }
 
-    if (wifi_menu_cursor == 1) {
+    if (wifi_menu_cursor == SET_ROW_WIFI_CONFIG) {
         if (!btn_trigger_clicked[IDX_OK] && !btn_trigger_repeat[IDX_RIGHT]) {
             return;
         }
@@ -541,21 +623,14 @@ void handle_wifi_menu_input() {
         btn_trigger_clicked[IDX_OK] = false;
     }
 
-    if (wifi_menu_cursor == 0) {
-        if (wifi_opt_sel == 0) {
-            memset(wifi_password, 0, sizeof(wifi_password));
-            memset(wifi_ssid, 0, sizeof(wifi_ssid));
+    if (wifi_menu_cursor == SET_ROW_USB) {
+        // SDカードをUSBドライブにする(PCとつながっているときだけ)
+        enter_usb_storage_mode();
+        return;
+    }
 
-            clear_wifi_settings_in_eeprom();
-
-            wifi_settings_saved = false;
-            wifi_user_enabled = false;
-            wifi_disconnect_requested = true;
-            wifi_menu_cursor = 1;
-            wifi_opt_sel = 1;
-            oled_need_refresh = true;
-            return;
-        } else if (wifi_opt_sel == 1) {
+    if (wifi_menu_cursor == SET_ROW_WIFI) {
+        if (wifi_opt_sel == 1) {
             if (wifi_user_enabled) {
                 wifi_user_enabled = false;
                 wifi_connect_requested = false;
@@ -575,7 +650,7 @@ void handle_wifi_menu_input() {
         }
     }
 
-    if (wifi_menu_cursor == 1) {
+    if (wifi_menu_cursor == SET_ROW_WIFI_CONFIG) {
         // 保存されている設定を読み直して編集する (未保存なら空から)
         if (!wifi_settings_saved || !load_wifi_settings_from_flash()) {
             memset(wifi_ssid, 0, sizeof(wifi_ssid));
@@ -583,13 +658,14 @@ void handle_wifi_menu_input() {
         }
         wifi_config_field = 0;
         wifi_config_pos = 0;
+        wifi_clear_confirm = false;
         wifi_scan_requested = true;
         current_state = STATE_WIFI_CONFIG;
         oled_need_refresh = true;
         return;
     }
 
-    if (wifi_menu_cursor == 2) {
+    if (wifi_menu_cursor == SET_ROW_WEB_PASS) {
         memset(web_password_edit, 0, sizeof(web_password_edit));
         strncpy(web_password_edit, web_password, WEB_PASSWORD_MAX_LEN);
         wifi_config_pos = 0;
@@ -617,7 +693,7 @@ void handle_web_pass_config_input() {
         }
         wifi_save_result_success = save_web_password(web_password_edit);
         settings_save_result_label = "Web password";
-        settings_save_return_cursor = 2;
+        settings_save_return_cursor = SET_ROW_WEB_PASS;
         wifi_save_result_until_ms = millis() + WIFI_SAVE_STATUS_DISPLAY_MS;
         current_state = STATE_WIFI_SAVE_RESULT;
         reset_and_ignore_pressed_buttons();
@@ -628,7 +704,34 @@ void handle_web_pass_config_input() {
     edit_text_buffer(web_password_edit, WEB_PASSWORD_MAX_LEN);
 }
 
+// 保存したWi-Fi設定(SSID・パスワード)を消し、Wi-FiをOFFにする
+static void clear_saved_wifi_settings() {
+    memset(wifi_password, 0, sizeof(wifi_password));
+    memset(wifi_ssid, 0, sizeof(wifi_ssid));
+    clear_wifi_settings_in_eeprom();
+    wifi_settings_saved = false;
+    wifi_user_enabled = false;
+    wifi_disconnect_requested = true;
+    wifi_opt_sel = 1;
+    wifi_menu_cursor = SET_ROW_WIFI_CONFIG;
+}
+
 void handle_wifi_config_input() {
+    // 設定を消すか確かめている間は、OKで消し、STOP/CANCELでやめる
+    if (wifi_clear_confirm) {
+        if (btn_trigger_clicked[IDX_OK]) {
+            clear_saved_wifi_settings();
+            wifi_clear_confirm = false;
+            reset_and_ignore_pressed_buttons();
+            oled_need_refresh = true;
+        } else if (btn_trigger_clicked[IDX_STOP] || btn_trigger_clicked[IDX_CANCEL]) {
+            wifi_clear_confirm = false;
+            reset_and_ignore_pressed_buttons();
+            oled_need_refresh = true;
+        }
+        return;
+    }
+
     if (btn_trigger_clicked[IDX_STOP]) {
         btn_trigger_clicked[IDX_STOP] = false;
         btn_trigger_clicked[IDX_OK] = false;
@@ -666,6 +769,13 @@ void handle_wifi_config_input() {
             btn_trigger_repeat[IDX_REC] = false;
             current_state = STATE_WIFI_MENU;
             reset_and_ignore_pressed_buttons();
+            oled_need_refresh = true;
+            return;
+        }
+
+        if (btn_trigger_clicked[IDX_LEFT] && wifi_settings_saved) {
+            btn_trigger_clicked[IDX_LEFT] = false;
+            wifi_clear_confirm = true;
             oled_need_refresh = true;
             return;
         }
@@ -731,6 +841,106 @@ void handle_wifi_config_input() {
     }
 }
 
+// ============================================================================
+// USBドライブ
+// ============================================================================
+// 電源を入れてから少しの間に、PCとつながっているか(PCに認識されたか)を見る。
+// つながっていたらUSBドライブにするかを聞く。決めるまではWi-Fiにつながない
+#define USB_STARTUP_CHECK_MS 4000
+
+void check_usb_at_startup() {
+    if (!usb_startup_pending) {
+        return;
+    }
+    if (usb_host_connected() && sd_card_mounted && current_state == STATE_IDLE) {
+        usb_startup_pending = false;
+        current_state = STATE_USB_PROMPT;
+        reset_and_ignore_pressed_buttons();
+        oled_need_refresh = true;
+    } else if (millis() >= USB_STARTUP_CHECK_MS || current_state != STATE_IDLE) {
+        usb_startup_pending = false;
+    }
+}
+
+// USBドライブをやめる。SDは、PCが書き換えた内容で読み直す
+// (ファイル一覧の画面に戻り、SDの抜き差しの監視が読み直す)
+static void exit_usb_storage_mode() {
+    usb_storage_stop();
+    usb_exit_confirm = false;
+    SD.end();
+    sd_card_mounted = false;
+    sd_card_inserted = false;
+    // PCがフォルダを消していることがあるので、先頭のフォルダから
+    current_path = "/";
+    total_items = 0;
+    current_cursor = 0;
+    scroll_offset = 0;
+    current_state = STATE_IDLE;
+    reset_and_ignore_pressed_buttons();
+    oled_need_refresh = true;
+}
+
+// SDカードをUSBドライブにする。できなければファイル一覧に戻る
+void enter_usb_storage_mode() {
+    if (!sd_card_mounted || !usb_host_connected()) {
+        return;
+    }
+    // 開いているファイルを閉じてから渡す(この後はPCだけがSDを読み書きする)
+    if (cmt_file) {
+        cmt_file.close();
+    }
+    if (!usb_storage_start()) {
+        // SDライブラリは止まっているので、ファイル一覧に戻って読み直す
+        exit_usb_storage_mode();
+        return;
+    }
+    usb_exit_confirm = false;
+    current_state = STATE_USB_STORAGE;
+    reset_and_ignore_pressed_buttons();
+    oled_need_refresh = true;
+}
+
+void handle_usb_prompt_input() {
+    if (btn_trigger_clicked[IDX_OK]) {
+        btn_trigger_clicked[IDX_OK] = false;
+        enter_usb_storage_mode();
+        if (current_state != STATE_USB_STORAGE) {
+            current_state = STATE_IDLE;
+            oled_need_refresh = true;
+        }
+        return;
+    }
+    if (btn_trigger_clicked[IDX_STOP] || btn_trigger_clicked[IDX_CANCEL]) {
+        current_state = STATE_IDLE;
+        reset_and_ignore_pressed_buttons();
+        oled_need_refresh = true;
+    }
+}
+
+void handle_usb_storage_input() {
+    // PCで取り出した、またはUSBが外れた
+    if (usb_storage_eject_requested() || !usb_host_connected()) {
+        exit_usb_storage_mode();
+        return;
+    }
+    if (usb_exit_confirm) {
+        if (btn_trigger_clicked[IDX_OK]) {
+            exit_usb_storage_mode();
+        } else if (btn_trigger_clicked[IDX_STOP] || btn_trigger_clicked[IDX_CANCEL]) {
+            usb_exit_confirm = false;
+            reset_and_ignore_pressed_buttons();
+            oled_need_refresh = true;
+        }
+        return;
+    }
+    // STOPでやめる(PCで取り出していないときは確かめる)
+    if (btn_trigger_clicked[IDX_STOP] || btn_trigger_clicked[IDX_CANCEL]) {
+        usb_exit_confirm = true;
+        reset_and_ignore_pressed_buttons();
+        oled_need_refresh = true;
+    }
+}
+
 void handle_wifi_connect_error_input() {
     if (!btn_trigger_clicked[IDX_OK]) {
         return;
@@ -741,6 +951,60 @@ void handle_wifi_connect_error_input() {
     wifi_connect_failed = false;
     current_state = STATE_WIFI_MENU;
     oled_need_refresh = true;
+}
+
+void handle_convert_menu_input() {
+    if (convert_result != 0) {
+        // 結果の表示。OK/STOPで一覧に戻り、書いたファイルを選ぶ
+        if (btn_trigger_clicked[IDX_OK] || btn_trigger_clicked[IDX_STOP] ||
+            btn_trigger_clicked[IDX_CANCEL]) {
+            bool select_new = (convert_result > 0);
+            convert_result = 0;
+            load_directory(current_path);
+            if (select_new) {
+                const char* slash = strrchr(convert_out_path, '/');
+                const char* name = slash ? slash + 1 : convert_out_path;
+                for (int i = 0; i < total_items; i++) {
+                    if (strcmp(file_list[i].name, name) == 0) {
+                        current_cursor = i;
+                        break;
+                    }
+                }
+            }
+            current_state = STATE_IDLE;
+            reset_and_ignore_pressed_buttons();
+            oled_need_refresh = true;
+        }
+        return;
+    }
+
+    if (btn_trigger_clicked[IDX_STOP] || btn_trigger_clicked[IDX_CANCEL]) {
+        current_state = STATE_IDLE;
+        reset_and_ignore_pressed_buttons();
+        oled_need_refresh = true;
+        return;
+    }
+    if (btn_trigger_clicked[IDX_LEFT] || btn_trigger_clicked[IDX_UP]) {
+        btn_trigger_clicked[IDX_LEFT] = false;
+        btn_trigger_clicked[IDX_UP] = false;
+        convert_fmt = step_convert_format(convert_fmt, -1);
+        oled_need_refresh = true;
+    }
+    if (btn_trigger_clicked[IDX_RIGHT] || btn_trigger_clicked[IDX_DOWN]) {
+        btn_trigger_clicked[IDX_RIGHT] = false;
+        btn_trigger_clicked[IDX_DOWN] = false;
+        convert_fmt = step_convert_format(convert_fmt, +1);
+        oled_need_refresh = true;
+    }
+    if (btn_trigger_clicked[IDX_OK]) {
+        btn_trigger_clicked[IDX_OK] = false;
+        // 変換中は進み具合を表示する(時間がかかる。WAVは一度RAWにしてから変換)
+        bool ok = convert_file_to_format(convert_src_path, convert_fmt, convert_out_path,
+                                         sizeof(convert_out_path));
+        convert_result = ok ? 1 : -1;
+        reset_and_ignore_pressed_buttons();
+        oled_need_refresh = true;
+    }
 }
 
 static void execute_safe_playback_seek(bool seek_prev) {
